@@ -4,6 +4,8 @@ A GPU-accelerated, continuous horizontal scrolling image slideshow for Windows, 
 
 Perfect for digital signage, photo displays, stream overlays, kiosks, and ambient wallpaper setups.
 
+Disclaimer: This code was developed with the help of AI.
+
 ## Features
 
 - **GPU-composited rendering** via Qt OpenGL with vsync support
