@@ -52,7 +52,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtCore import Qt, QTimer, QElapsedTimer, Signal
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QKeyEvent, QFont,
-    QPen, QImageReader, QSurfaceFormat, QMovie,
+    QPen, QImageReader, QSurfaceFormat, QMovie, QIcon
 )
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
@@ -944,6 +944,7 @@ class MainWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.setWindowTitle("Image Marquee")
+        self.setWindowIcon(QIcon("image_marquee.ico"))
         self.setMinimumSize(800, 400)
         self.setMenuWidget(None)
         self.image_folder: str = args.folder
