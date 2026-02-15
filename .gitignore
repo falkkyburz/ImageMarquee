@@ -1,0 +1,5 @@
+build
+dist
+.python-version
+.venv
+*.spec
