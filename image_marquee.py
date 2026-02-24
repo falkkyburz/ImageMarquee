@@ -1076,6 +1076,26 @@ class MainWindow(QMainWindow):
 # CLI
 # ---------------------------------------------------------------------------
 
+def validate_color(color_str: str) -> str:
+    """Validate that the color string is a valid Qt color."""
+    qc = QColor(color_str)
+    if not qc.isValid():
+        raise argparse.ArgumentTypeError(
+            f"Invalid color '{color_str}'. Use hex format like #FF0000 or color names like 'red'"
+        )
+    return color_str
+
+
+def clamp_int(value: int, min_val: int, max_val: int) -> int:
+    """Clamp an integer to [min_val, max_val]."""
+    return max(min_val, min(max_val, value))
+
+
+def clamp_float(value: float, min_val: float, max_val: float) -> float:
+    """Clamp a float to [min_val, max_val]."""
+    return max(min_val, min(max_val, value))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Image Marquee - Continuous horizontal scrolling slideshow"
@@ -1086,27 +1106,27 @@ def parse_args():
     )
     parser.add_argument(
         "--speed", type=float, default=120.0,
-        help="Scroll speed in pixels per second (default: 120.0)"
+        help="Scroll speed in pixels/sec (1.0-1000.0, default: 120.0)"
     )
     parser.add_argument(
         "--gap", type=int, default=20,
-        help="Gap between images in pixels (default: 0)"
+        help="Gap between images in pixels (0-256, default: 20)"
     )
     parser.add_argument(
         "--height", type=int, default=0,
-        help="Fixed image height in pixels (0 = fill window height)"
+        help="Fixed image height in pixels (0=auto, 100-4096, default: 0)"
     )
     parser.add_argument(
         "--cache", type=int, default=64,
-        help="Max number of scaled images to keep in memory (default: 64)"
+        help="Max scaled images in memory (8-1024, default: 64)"
     )
     parser.add_argument(
         "--prefetch", type=int, default=2000,
-        help="Prefetch lookahead in pixels (default: 2000)"
+        help="Prefetch lookahead in pixels (1000-100000, default: 2000)"
     )
     parser.add_argument(
         "--fps", type=int, default=144,
-        help="Target frame rate cap (default: 144)"
+        help="Target frame rate cap (1-240, default: 144)"
     )
     parser.add_argument(
         "--recursive", "-r", action="store_true",
@@ -1121,10 +1141,21 @@ def parse_args():
         help="Start in fullscreen mode"
     )
     parser.add_argument(
-        "--bg", type=str, default="#000000",
-        help="Background color as hex string (default: #000000)"
+        "--bg", type=validate_color, default="#000000",
+        help="Background color (hex like #FF0000 or name like 'red', default: #000000)"
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # Clamp numeric arguments to safe ranges
+    args.speed = clamp_float(args.speed, 1.0, 1000.0)
+    args.gap = clamp_int(args.gap, 0, 256)
+    args.height = clamp_int(args.height, 0, 4096)
+    args.cache = clamp_int(args.cache, 8, 1024)
+    args.prefetch = clamp_int(args.prefetch, 1000, 100000)
+    args.fps = clamp_int(args.fps, 1, 240)
+
+    return args
 
 
 def main():
