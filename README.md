@@ -1,5 +1,7 @@
 # Image Marquee
 
+![image_marquee.png](image_marquee.png)
+
 A GPU-accelerated, continuous horizontal scrolling image slideshow for Windows, macOS, and Linux. Built with Python and PySide6 (Qt6 OpenGL).
 
 Perfect for digital signage, photo displays, stream overlays, kiosks, and ambient wallpaper setups.
