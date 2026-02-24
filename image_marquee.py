@@ -6,29 +6,29 @@ Usage:
     python image_marquee.py [OPTIONS]
 
 Options:
-    --folder PATH       Path to image folder (default: open dialog)
-    --speed FLOAT       Scroll speed in pixels/sec (default: 120.0)
-    --gap INT           Gap between images in pixels (default: 20)
-    --height INT        Image display height in pixels (default: 0 = auto/fullscreen)
-    --cache INT         Max images to keep in memory (default: 64)
-    --prefetch INT      Prefetch lookahead in pixels (default: 2000)
-    --fps INT           Target frame rate cap (default: 144)
-    --shuffle           Shuffle image order
-    --recursive, -r     Scan subfolders recursively
-    --fullscreen        Start in fullscreen mode
-    --bg COLOR          Background color as hex (default: #000000)
+    -p, --path PATH     Path to image folder (default: open dialog)
+    -v, --speed FLOAT   Scroll speed in pixels/sec (default: 120.0)
+    -g, --gap INT       Gap between images in pixels (default: 20)
+    -H, --height INT    Image display height in pixels (default: 0 = auto/fullscreen)
+    -c, --cache INT     Max images to keep in memory (default: 64)
+    -P, --prefetch INT  Prefetch lookahead in pixels (default: 2000)
+    -f, --fps INT       Target frame rate cap (default: 144)
+    -s, --shuffle       Shuffle image order
+    -r, --recursive     Scan subfolders recursively
+    -F, --fullscreen    Start in fullscreen mode
+    -b, --bg COLOR      Background color as hex (default: #000000)
 
 Controls:
     F / F11         Toggle fullscreen
     Space           Pause / Resume
     Up / +          Increase speed
     Down / -        Decrease speed
-    R               Reshuffle images
-    T               Toggle recursive folder scanning
+    S               Reshuffle images
+    R               Toggle recursive folder scanning
     O               Open folder
     Left            Scroll direction: right-to-left
     Right           Scroll direction: left-to-right
-    ?               Show / hide controls
+    H               Show / hide controls
     D               Toggle FPS counter
     A               Toggle always on top
     Q / Escape      Quit
@@ -763,7 +763,7 @@ class MarqueeWidget(QOpenGLWidget):
             painter.setFont(font)
             painter.drawText(
                 self.rect(), Qt.AlignCenter,
-                "No images loaded.\nPress O to open a folder  ·  ? for help"
+                "No images loaded.\nPress O to open a folder  ·  H for help"
             )
             painter.end()
             return
@@ -893,9 +893,9 @@ CONTROLS_TEXT = "\n".join(
         ("Left", "Scroll  ←"),
         ("Right", "Scroll  →"),
         ("O", "Open folder"),
-        ("R", "Reshuffle images"),
-        ("T", "Toggle recursive scan"),
-        ("?", "Toggle this help"),
+        ("S", "Reshuffle images"),
+        ("R", "Toggle recursive scan"),
+        ("H", "Toggle this help"),
         ("D", "Toggle FPS counter"),
         ("A", "Toggle always on top"),
         ("Q / Escape", "Quit"),
@@ -947,7 +947,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon("image_marquee.ico"))
         self.setMinimumSize(800, 400)
         self.setMenuWidget(None)
-        self.image_folder: str = args.folder
+        self.image_folder: str = args.path
         self.recursive: bool = args.recursive
         self.shuffle: bool = args.shuffle
 
@@ -1039,17 +1039,17 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key_O:
             self._open_folder()
 
-        elif key == Qt.Key_R:
+        elif key == Qt.Key_S:
             self._reload_images(shuffle=True)
             self.hud.flash("🔀 Reshuffled")
 
-        elif key == Qt.Key_T:
+        elif key == Qt.Key_R:
             self.recursive = not self.recursive
             state = "ON" if self.recursive else "OFF"
             self.hud.flash(f"📂 Recursive: {state}")
             self._reload_images()
 
-        elif key == Qt.Key_Question:
+        elif key == Qt.Key_H:
             self.help_overlay.toggle()
 
         elif key == Qt.Key_D:
@@ -1101,47 +1101,47 @@ def parse_args():
         description="Image Marquee - Continuous horizontal scrolling slideshow"
     )
     parser.add_argument(
-        "--folder", type=str, default="",
+        "-p", "--path", type=str, default="",
         help="Path to folder containing images (default: open dialog)"
     )
     parser.add_argument(
-        "--speed", type=float, default=120.0,
+        "-v", "--speed", type=float, default=120.0,
         help="Scroll speed in pixels/sec (1.0-1000.0, default: 120.0)"
     )
     parser.add_argument(
-        "--gap", type=int, default=20,
+        "-g", "--gap", type=int, default=20,
         help="Gap between images in pixels (0-256, default: 20)"
     )
     parser.add_argument(
-        "--height", type=int, default=0,
+        "-H", "--height", type=int, default=0,
         help="Fixed image height in pixels (0=auto, 100-4096, default: 0)"
     )
     parser.add_argument(
-        "--cache", type=int, default=64,
+        "-c", "--cache", type=int, default=64,
         help="Max scaled images in memory (8-1024, default: 64)"
     )
     parser.add_argument(
-        "--prefetch", type=int, default=2000,
+        "-P", "--prefetch", type=int, default=2000,
         help="Prefetch lookahead in pixels (1000-100000, default: 2000)"
     )
     parser.add_argument(
-        "--fps", type=int, default=144,
+        "-f", "--fps", type=int, default=144,
         help="Target frame rate cap (1-240, default: 144)"
     )
     parser.add_argument(
-        "--recursive", "-r", action="store_true",
+        "-r", "--recursive", action="store_true",
         help="Scan subfolders recursively for images"
     )
     parser.add_argument(
-        "--shuffle", action="store_true",
+        "-s", "--shuffle", action="store_true",
         help="Shuffle image order on load"
     )
     parser.add_argument(
-        "--fullscreen", action="store_true",
+        "-F", "--fullscreen", action="store_true",
         help="Start in fullscreen mode"
     )
     parser.add_argument(
-        "--bg", type=validate_color, default="#000000",
+        "-b", "--bg", type=validate_color, default="#000000",
         help="Background color (hex like #FF0000 or name like 'red', default: #000000)"
     )
 
@@ -1167,6 +1167,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Image Marquee")
+    app.setStyle("Fusion")
     window = MainWindow(args)
     if not window.isFullScreen():
         window.show()
