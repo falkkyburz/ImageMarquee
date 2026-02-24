@@ -31,30 +31,30 @@ pip install PySide6
 python image_marquee.py
 
 # Or specify a folder directly
-python image_marquee.py --folder ~/Pictures --shuffle --fullscreen
+python image_marquee.py --path ~/Pictures --shuffle --fullscreen
 
 # Recursive scan with custom speed
-python image_marquee.py --folder ~/Photos -r --speed 200
+python image_marquee.py --path ~/Photos -r --speed 200
 
 # Kiosk mode: fullscreen, shuffled, always from a folder
-python image_marquee.py --folder /media/signage --fullscreen --shuffle -r
+python image_marquee.py --path /media/signage --fullscreen --shuffle -r
 ```
 
 ## Options
 
 | Option | Default | Description |
 |---|---|---|
-| `--folder PATH` | *(open dialog)* | Path to image folder |
-| `--speed FLOAT` | `120.0` | Scroll speed in pixels/sec |
-| `--gap INT` | `20` | Gap between images in pixels |
-| `--height INT` | `0` (auto) | Fixed image height (`0` = fill window) |
-| `--cache INT` | `64` | Max scaled images in memory |
-| `--prefetch INT` | `2000` | Prefetch lookahead in pixels |
-| `--fps INT` | `144` | Frame rate cap |
-| `--shuffle` | off | Shuffle image order |
-| `--recursive`, `-r` | off | Scan subfolders recursively |
-| `--fullscreen` | off | Start in fullscreen |
-| `--bg COLOR` | `#000000` | Background color (hex) |
+| `-p, --path PATH` | *(open dialog)* | Path to image folder |
+| `-v, --speed FLOAT` | `120.0` | Scroll speed in pixels/sec |
+| `-g, --gap INT` | `20` | Gap between images in pixels |
+| `-H, --height INT` | `0` (auto) | Fixed image height (`0` = fill window) |
+| `-c, --cache INT` | `64` | Max scaled images in memory |
+| `-P, --prefetch INT` | `2000` | Prefetch lookahead in pixels |
+| `-f, --fps INT` | `144` | Frame rate cap |
+| `-s, --shuffle` | off | Shuffle image order |
+| `-r, --recursive` | off | Scan subfolders recursively |
+| `-F, --fullscreen` | off | Start in fullscreen |
+| `-b, --bg COLOR` | `#000000` | Background color (hex) |
 
 ## Keyboard Controls
 
@@ -62,16 +62,16 @@ python image_marquee.py --folder /media/signage --fullscreen --shuffle -r
 |---|---|
 | `F` / `F11` | Toggle fullscreen |
 | `Space` | Pause / Resume |
-| `↑` / `+` | Increase speed |
-| `↓` / `-` | Decrease speed |
-| `←` | Scroll right-to-left |
-| `→` | Scroll left-to-right |
+| `Up` / `+` | Increase speed |
+| `Down` / `-` | Decrease speed |
+| `Left` | Scroll right-to-left (←) |
+| `Right` | Scroll left-to-right (→) |
 | `O` | Open folder |
-| `R` | Reshuffle images |
-| `T` | Toggle recursive scan |
+| `S` | Reshuffle images |
+| `R` | Toggle recursive scan |
 | `A` | Toggle always on top |
-| `D` | Toggle FPS/debug overlay |
-| `?` | Show/hide controls |
+| `D` | Toggle FPS counter |
+| `H` | Show/hide controls |
 | `Q` / `Esc` | Quit |
 
 ## Building a Standalone Executable
