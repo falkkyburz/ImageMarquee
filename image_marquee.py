@@ -552,15 +552,11 @@ class VideoManager:
         for p in paths:
             state = self._players.pop(p, None)
             if state is not None:
-                state.player.stop()
-                state.player.deleteLater()
-                state.sink.deleteLater()
+                self._dispose_state(state)
 
     def invalidate(self):
         for state in self._players.values():
-            state.player.stop()
-            state.player.deleteLater()
-            state.sink.deleteLater()
+            self._dispose_state(state)
         self._players.clear()
 
     def _on_frame_changed(self, entry: ImageEntry, frame: QVideoFrame):
@@ -591,9 +587,16 @@ class VideoManager:
     def _evict(self):
         while len(self._players) > self.max_size:
             _, state = self._players.popitem(last=False)
-            state.player.stop()
-            state.player.deleteLater()
-            state.sink.deleteLater()
+            self._dispose_state(state)
+
+    def _dispose_state(self, state: VideoState):
+        """Release backend resources as aggressively as Qt allows."""
+        state.pixmap = QPixmap()
+        state.player.stop()
+        state.player.setVideoOutput(None)
+        state.player.setSource(QUrl())
+        state.player.deleteLater()
+        state.sink.deleteLater()
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +616,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.gifs = GifManager(max_size=max(8, cache_size // 2))
         self.videos = VideoManager(
             self._handle_media_dimensions_changed,
-            max_size=max(4, cache_size // 4),
+            max_size=max(2, min(4, cache_size // 4)),
             parent=self,
         )
         self.prefetcher = PrefetchWorker()
@@ -865,8 +868,8 @@ class MarqueeWidget(QOpenGLWidget):
         for i, _p in self._iter_wrapped_items(left, right):
             yield i
 
-    def _video_keep_range(self) -> tuple[float, float]:
-        """Range around the viewport where video players should stay active."""
+    def _keep_range(self) -> tuple[float, float]:
+        """Range around the viewport where decoded media should stay cached."""
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
 
@@ -874,12 +877,19 @@ class MarqueeWidget(QOpenGLWidget):
             return view_left - self.width(), view_right + self.prefetch_px
         return view_left - self.prefetch_px, view_right + self.width()
 
+    def _video_active_range(self) -> tuple[float, float]:
+        """Much tighter range for live video players to avoid backend bloat."""
+        view_left = -self.scroll_offset
+        view_right = view_left + self.width()
+        margin = max(120, min(self.prefetch_px // 8, self.width() // 6))
+        return view_left - margin, view_right + margin
+
     def _reap_behind(self):
         """Evict cached images outside the keep zone using binary search."""
         if not self.entries or self._total_width == 0:
             return
 
-        keep_left, keep_right = self._video_keep_range()
+        keep_left, keep_right = self._keep_range()
 
         # Find indices inside the keep zone (with wrapping)
         keep_indices: set[int] = set()
@@ -912,7 +922,7 @@ class MarqueeWidget(QOpenGLWidget):
         if not self.entries or self._total_width == 0:
             return
 
-        keep_left, keep_right = self._video_keep_range()
+        keep_left, keep_right = self._video_active_range()
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
 
