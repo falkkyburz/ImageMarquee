@@ -42,6 +42,8 @@ import random
 import argparse
 import bisect
 import threading
+import subprocess
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -210,6 +212,114 @@ class PrefetchWorker:
                     if not scaled.isNull():
                         self._results[path] = scaled
                     self._in_flight.discard(path)
+
+
+class VideoPreviewWorker:
+    """Extracts lightweight preview frames for videos off the GUI thread."""
+
+    def __init__(self, max_pending: int = 4):
+        self._lock = threading.Lock()
+        self._max_pending = max(1, max_pending)
+        self._requests: list[tuple[Path, int]] = []
+        self._results: dict[Path, QImage] = {}
+        self._in_flight: set[Path] = set()
+        self._stop = threading.Event()
+        self._work = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, entries: list[ImageEntry], display_height: int):
+        with self._lock:
+            for entry in entries:
+                if (entry.path not in self._in_flight
+                        and entry.path not in self._results
+                        and len(self._requests) < self._max_pending):
+                    self._requests.append((entry.path, display_height))
+                    self._in_flight.add(entry.path)
+        self._work.set()
+
+    def collect(self) -> dict[Path, QImage]:
+        with self._lock:
+            if not self._results:
+                return {}
+            results = self._results
+            self._results = {}
+            return results
+
+    def clear(self):
+        with self._lock:
+            self._requests.clear()
+            self._results.clear()
+            self._in_flight.clear()
+
+    def discard_paths(self, paths: set[Path]):
+        with self._lock:
+            self._requests = [(p, dh) for p, dh in self._requests if p not in paths]
+            for p in paths:
+                self._results.pop(p, None)
+                self._in_flight.discard(p)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._requests) + len(self._results)
+
+    def stop(self):
+        self._stop.set()
+        self._work.set()
+        self._thread.join(timeout=2)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._work.wait(timeout=0.5)
+            self._work.clear()
+
+            while True:
+                with self._lock:
+                    if len(self._results) >= self._max_pending:
+                        break
+                    if not self._requests:
+                        break
+                    path, dh = self._requests.pop(0)
+
+                if self._stop.is_set():
+                    return
+
+                preview = self._extract_preview(path, dh)
+                with self._lock:
+                    if preview is not None and not preview.isNull():
+                        self._results[path] = preview
+                    self._in_flight.discard(path)
+
+    def _extract_preview(self, path: Path, display_height: int) -> QImage | None:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-ss", "0.15",
+            "-i", str(path),
+            "-frames:v", "1",
+            "-vf", f"scale=-2:{display_height}",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=8,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+        if result.returncode != 0 or not result.stdout:
+            return None
+
+        image = QImage.fromData(result.stdout, b"PNG")
+        return image if not image.isNull() else None
 
 
 class FolderScanner:
@@ -465,13 +575,25 @@ class GifManager:
 class VideoState:
     """Reusable playback slot for one active video."""
 
-    __slots__ = ("player", "sink", "pixmap", "entry")
+    __slots__ = ("player", "sink", "pixmap", "entry", "pending_seek_ms")
 
     def __init__(self, player: QMediaPlayer, sink: QVideoSink):
         self.player = player
         self.sink = sink
         self.pixmap = QPixmap()
         self.entry: ImageEntry | None = None
+        self.pending_seek_ms: int | None = None
+
+
+class VideoTimeline:
+    """Playback clock for one logical video, independent of viewport assignment."""
+
+    __slots__ = ("position_ms", "duration_ms", "timestamp_ms")
+
+    def __init__(self):
+        self.position_ms = 0
+        self.duration_ms = 0
+        self.timestamp_ms = time.monotonic_ns() // 1_000_000
 
 
 class VideoManager:
@@ -486,6 +608,7 @@ class VideoManager:
         self._parent = parent
         self._on_dimensions_changed = on_dimensions_changed
         self._snapshot_cache: OrderedDict[Path, QPixmap] = OrderedDict()
+        self._timelines: dict[Path, VideoTimeline] = {}
 
         for _ in range(self.max_size):
             self._available.append(self._make_state())
@@ -536,12 +659,18 @@ class VideoManager:
         return len(self._players)
 
     def set_paused(self, paused: bool):
+        now_ms = self._now_ms()
+        if paused and not self._paused:
+            for state in self._players.values():
+                self._capture_timeline(state, now_ms)
         self._paused = paused
         for state in self._players.values():
             if paused:
                 state.player.pause()
             else:
                 state.player.play()
+        if not paused:
+            self._resync_timelines(now_ms)
 
     def evict_paths(self, paths: set[Path]):
         """Actively stop and remove specific video players."""
@@ -595,14 +724,13 @@ class VideoManager:
     def _assign_state(self, state: VideoState, entry: ImageEntry):
         state.entry = entry
         state.pixmap = QPixmap()
+        state.pending_seek_ms = self._estimate_position(entry.path)
         self._snapshot_cache.pop(entry.path, None)
         state.player.stop()
         state.player.setSource(QUrl())
+        state.player.setPlaybackRate(1.0)
         state.player.setSource(QUrl.fromLocalFile(str(entry.path)))
-        if self._paused:
-            state.player.pause()
-        else:
-            state.player.play()
+        state.player.pause()
 
     def _release_state(self, state: VideoState, keep_snapshot: bool = True):
         """Stop playback and clear the assigned source without destroying the slot."""
@@ -611,9 +739,11 @@ class VideoManager:
             self._snapshot_cache.move_to_end(state.entry.path)
             self._evict_snapshots()
 
+        self._capture_timeline(state, self._now_ms())
         state.player.stop()
         state.player.setSource(QUrl())
         state.entry = None
+        state.pending_seek_ms = None
         state.pixmap = QPixmap()
 
     def _evict_snapshots(self):
@@ -634,9 +764,84 @@ class VideoManager:
         player.errorOccurred.connect(
             lambda *_args, s=state: self._on_player_error(s)
         )
+        player.positionChanged.connect(
+            lambda pos, s=state: self._on_position_changed(s, pos)
+        )
+        player.durationChanged.connect(
+            lambda duration, s=state: self._on_duration_changed(s, duration)
+        )
+        player.mediaStatusChanged.connect(
+            lambda status, s=state: self._on_media_status_changed(s, status)
+        )
         player.setVideoOutput(sink)
         player.setLoops(QMediaPlayer.Loops.Infinite)
         return state
+
+    def _on_position_changed(self, state: VideoState, position: int):
+        if state.entry is None:
+            return
+        timeline = self._timeline_for(state.entry.path)
+        timeline.position_ms = max(0, position)
+        timeline.timestamp_ms = self._now_ms()
+
+    def _on_duration_changed(self, state: VideoState, duration: int):
+        if state.entry is None or duration <= 0:
+            return
+        timeline = self._timeline_for(state.entry.path)
+        timeline.duration_ms = duration
+        timeline.timestamp_ms = self._now_ms()
+
+    def _on_media_status_changed(self, state: VideoState, status):
+        if state.entry is None:
+            return
+        if status not in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            return
+        if state.pending_seek_ms is not None:
+            state.player.setPosition(state.pending_seek_ms)
+            state.pending_seek_ms = None
+        if self._paused:
+            state.player.pause()
+        else:
+            state.player.play()
+
+    def _timeline_for(self, path: Path) -> VideoTimeline:
+        timeline = self._timelines.get(path)
+        if timeline is None:
+            timeline = VideoTimeline()
+            self._timelines[path] = timeline
+        return timeline
+
+    def _estimate_position(self, path: Path) -> int:
+        timeline = self._timelines.get(path)
+        if timeline is None:
+            return 0
+
+        position = timeline.position_ms
+        if not self._paused:
+            position += max(0, self._now_ms() - timeline.timestamp_ms)
+        if timeline.duration_ms > 0:
+            position %= timeline.duration_ms
+        return max(0, position)
+
+    def _capture_timeline(self, state: VideoState, now_ms: int):
+        if state.entry is None:
+            return
+        timeline = self._timeline_for(state.entry.path)
+        timeline.position_ms = max(0, state.player.position())
+        duration_ms = state.player.duration()
+        if duration_ms > 0:
+            timeline.duration_ms = duration_ms
+        timeline.timestamp_ms = now_ms
+
+    def _resync_timelines(self, now_ms: int):
+        for timeline in self._timelines.values():
+            timeline.timestamp_ms = now_ms
+
+    def _now_ms(self) -> int:
+        return time.monotonic_ns() // 1_000_000
 
 
 # ---------------------------------------------------------------------------
