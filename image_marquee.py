@@ -489,42 +489,55 @@ class VideoManager:
             self._display_height = h
             self.invalidate()
 
-    def get_frame(self, entry: ImageEntry) -> QPixmap | None:
-        """Get the most recent decoded frame as a scaled QPixmap."""
+    def ensure_loaded(self, entry: ImageEntry):
+        """Create a player for this video if it is not already active."""
         key = entry.path
 
         if key in self._players:
             self._players.move_to_end(key)
-            state = self._players[key]
+            return
+
+        sink = QVideoSink(self._parent)
+        player = QMediaPlayer(self._parent)
+        state = VideoState(player, sink)
+
+        sink.videoFrameChanged.connect(
+            lambda frame, e=entry: self._on_frame_changed(e, frame)
+        )
+        sink.videoSizeChanged.connect(
+            lambda size, e=entry: self._on_video_size_changed(e, size)
+        )
+        player.errorOccurred.connect(
+            lambda *_args, e=entry: self._on_player_error(e)
+        )
+
+        player.setVideoOutput(sink)
+        player.setLoops(QMediaPlayer.Loops.Infinite)
+        player.setSource(QUrl.fromLocalFile(str(entry.path)))
+        if self._paused:
+            player.pause()
         else:
-            sink = QVideoSink(self._parent)
-            player = QMediaPlayer(self._parent)
-            state = VideoState(player, sink)
+            player.play()
 
-            sink.videoFrameChanged.connect(
-                lambda frame, e=entry: self._on_frame_changed(e, frame)
-            )
-            sink.videoSizeChanged.connect(
-                lambda size, e=entry: self._on_video_size_changed(e, size)
-            )
-            player.errorOccurred.connect(
-                lambda *_args, e=entry: self._on_player_error(e)
-            )
+        self._players[key] = state
+        self._evict()
 
-            player.setVideoOutput(sink)
-            player.setLoops(QMediaPlayer.Loops.Infinite)
-            player.setSource(QUrl.fromLocalFile(str(entry.path)))
-            if self._paused:
-                player.pause()
-            else:
-                player.play()
-
-            self._players[key] = state
-            self._evict()
+    def get_frame(self, entry: ImageEntry) -> QPixmap | None:
+        """Get the most recent decoded frame for an already-loaded video."""
+        state = self._players.get(entry.path)
+        if state is None:
+            return None
 
         if state.pixmap.isNull():
             return None
         return state.pixmap
+
+    def has_key(self, path: Path) -> bool:
+        return path in self._players
+
+    @property
+    def active_count(self) -> int:
+        return len(self._players)
 
     def set_paused(self, paused: bool):
         self._paused = paused
@@ -786,6 +799,9 @@ class MarqueeWidget(QOpenGLWidget):
         if self.entries and self._tick_count % 4 == 0:
             self._request_prefetch()
 
+        if self.entries:
+            self._ensure_nearby_videos_loaded()
+
         # Smooth-upgrade one image per tick (skip at high speed)
         upgraded = False
         if self.speed < SMOOTH_SPEED_THRESHOLD:
@@ -828,35 +844,47 @@ class MarqueeWidget(QOpenGLWidget):
         end = min(end, len(self._positions))
         return start, end
 
+    def _iter_wrapped_items(self, left: float, right: float):
+        """Yield unique entry indices and positions overlapping a wrapped range."""
+        seen: dict[int, float] = {}
+        for offset in (0, self._total_width, -self._total_width):
+            s, e = self._find_index_range(left - offset, right - offset)
+            for i in range(s, e):
+                p = self._positions[i] + offset
+                entry = self.entries[i]
+                if p + entry.scaled_width >= left and p <= right:
+                    prev = seen.get(i)
+                    if prev is None or abs(p - left) < abs(prev - left):
+                        seen[i] = p
+
+        for i, p in seen.items():
+            yield i, p
+
+    def _iter_wrapped_indices(self, left: float, right: float):
+        """Yield entry indices overlapping a wrapped world-space range."""
+        for i, _p in self._iter_wrapped_items(left, right):
+            yield i
+
+    def _video_keep_range(self) -> tuple[float, float]:
+        """Range around the viewport where video players should stay active."""
+        view_left = -self.scroll_offset
+        view_right = view_left + self.width()
+
+        if self.direction == -1:
+            return view_left - self.width(), view_right + self.prefetch_px
+        return view_left - self.prefetch_px, view_right + self.width()
+
     def _reap_behind(self):
         """Evict cached images outside the keep zone using binary search."""
         if not self.entries or self._total_width == 0:
             return
 
-        total = self._total_width
-        widget_w = self.width()
-        lookahead = self.prefetch_px
-
-        view_left = -self.scroll_offset
-        view_right = view_left + widget_w
-
-        # Keep zone
-        if self.direction == -1:
-            keep_left = view_left - widget_w
-            keep_right = view_right + lookahead
-        else:
-            keep_left = view_left - lookahead
-            keep_right = view_right + widget_w
+        keep_left, keep_right = self._video_keep_range()
 
         # Find indices inside the keep zone (with wrapping)
         keep_indices: set[int] = set()
-        for offset in (0, total, -total):
-            s, e = self._find_index_range(keep_left - offset, keep_right - offset)
-            for i in range(s, e):
-                # Verify overlap (binary search gives conservative range)
-                p = self._positions[i] + offset
-                if p + self.entries[i].scaled_width >= keep_left and p <= keep_right:
-                    keep_indices.add(i)
+        for i in self._iter_wrapped_indices(keep_left, keep_right):
+            keep_indices.add(i)
 
         # Evict anything that's cached but not in the keep zone
         to_evict: set[Path] = set()
@@ -879,6 +907,47 @@ class MarqueeWidget(QOpenGLWidget):
             self.videos.evict_paths(to_evict)
             self.prefetcher.discard_paths(to_evict)
 
+    def _ensure_nearby_videos_loaded(self):
+        """Start video players only for videos near the viewport."""
+        if not self.entries or self._total_width == 0:
+            return
+
+        keep_left, keep_right = self._video_keep_range()
+        view_left = -self.scroll_offset
+        view_right = view_left + self.width()
+
+        candidates: list[tuple[float, ImageEntry]] = []
+        for i, p in self._iter_wrapped_items(keep_left, keep_right):
+            entry = self.entries[i]
+            if not entry.is_video:
+                continue
+
+            item_left = p
+            item_right = p + entry.scaled_width
+            if item_right < view_left:
+                distance = view_left - item_right
+            elif item_left > view_right:
+                distance = item_left - view_right
+            else:
+                distance = 0.0
+            candidates.append((distance, entry))
+
+        if not candidates:
+            if self.videos._players:
+                self.videos.evict_paths(set(self.videos._players.keys()))
+            return
+
+        candidates.sort(key=lambda item: item[0])
+        desired_entries = [entry for _distance, entry in candidates[:self.videos.max_size]]
+        desired_paths = {entry.path for entry in desired_entries}
+
+        stale_paths = set(self.videos._players.keys()) - desired_paths
+        if stale_paths:
+            self.videos.evict_paths(stale_paths)
+
+        for entry in desired_entries:
+            self.videos.ensure_loaded(entry)
+
     def _request_prefetch(self):
         """Identify images approaching the viewport using binary search."""
         if not self.entries or self._total_width == 0:
@@ -900,14 +969,10 @@ class MarqueeWidget(QOpenGLWidget):
             fetch_right = view_left
 
         to_prefetch: list[ImageEntry] = []
-        for offset in (0, total, -total):
-            s, e = self._find_index_range(fetch_left - offset, fetch_right - offset)
-            for i in range(s, e):
-                entry = self.entries[i]
-                p = self._positions[i] + offset
-                if p + entry.scaled_width >= fetch_left and p <= fetch_right:
-                    if not entry.is_gif and not entry.is_video and not self.cache.has_key(entry.path):
-                        to_prefetch.append(entry)
+        for i in self._iter_wrapped_indices(fetch_left, fetch_right):
+            entry = self.entries[i]
+            if not entry.is_gif and not entry.is_video and not self.cache.has_key(entry.path):
+                to_prefetch.append(entry)
 
         if to_prefetch:
             self.prefetcher.request(to_prefetch, dh)
