@@ -463,74 +463,70 @@ class GifManager:
 
 
 class VideoState:
-    """Playback state for one lazily-loaded video."""
+    """Reusable playback slot for one active video."""
 
-    __slots__ = ("player", "sink", "pixmap")
+    __slots__ = ("player", "sink", "pixmap", "entry")
 
     def __init__(self, player: QMediaPlayer, sink: QVideoSink):
         self.player = player
         self.sink = sink
         self.pixmap = QPixmap()
+        self.entry: ImageEntry | None = None
 
 
 class VideoManager:
-    """Manages QMediaPlayer instances for looping inline videos."""
+    """Manages a fixed pool of looping inline video players."""
 
     def __init__(self, on_dimensions_changed, max_size: int = 16, parent=None):
-        self.max_size = max(2, max_size)
+        self.max_size = max(1, max_size)
         self._players: OrderedDict[Path, VideoState] = OrderedDict()
+        self._available: list[VideoState] = []
         self._display_height: int = 600
         self._paused: bool = False
         self._parent = parent
         self._on_dimensions_changed = on_dimensions_changed
+        self._snapshot_cache: OrderedDict[Path, QPixmap] = OrderedDict()
+
+        for _ in range(self.max_size):
+            self._available.append(self._make_state())
 
     def set_display_height(self, h: int):
         if h != self._display_height:
             self._display_height = h
             self.invalidate()
 
-    def ensure_loaded(self, entry: ImageEntry):
-        """Create a player for this video if it is not already active."""
-        key = entry.path
+    def set_active_entries(self, entries: list[ImageEntry]):
+        """Retarget the fixed player pool to the requested nearby videos."""
+        desired_paths = {entry.path for entry in entries}
+        stale_paths = [path for path in self._players if path not in desired_paths]
+        for path in stale_paths:
+            state = self._players.pop(path)
+            self._release_state(state, keep_snapshot=True)
+            self._available.append(state)
 
-        if key in self._players:
-            self._players.move_to_end(key)
-            return
-
-        sink = QVideoSink(self._parent)
-        player = QMediaPlayer(self._parent)
-        state = VideoState(player, sink)
-
-        sink.videoFrameChanged.connect(
-            lambda frame, e=entry: self._on_frame_changed(e, frame)
-        )
-        sink.videoSizeChanged.connect(
-            lambda size, e=entry: self._on_video_size_changed(e, size)
-        )
-        player.errorOccurred.connect(
-            lambda *_args, e=entry: self._on_player_error(e)
-        )
-
-        player.setVideoOutput(sink)
-        player.setLoops(QMediaPlayer.Loops.Infinite)
-        player.setSource(QUrl.fromLocalFile(str(entry.path)))
-        if self._paused:
-            player.pause()
-        else:
-            player.play()
-
-        self._players[key] = state
-        self._evict()
+        for entry in entries:
+            existing = self._players.get(entry.path)
+            if existing is not None:
+                existing.entry = entry
+                self._players.move_to_end(entry.path)
+                continue
+            if not self._available:
+                break
+            state = self._available.pop()
+            self._assign_state(state, entry)
+            self._players[entry.path] = state
 
     def get_frame(self, entry: ImageEntry) -> QPixmap | None:
-        """Get the most recent decoded frame for an already-loaded video."""
+        """Get the latest live frame or a recent still snapshot."""
         state = self._players.get(entry.path)
-        if state is None:
-            return None
+        if state is not None and not state.pixmap.isNull():
+            return state.pixmap
 
-        if state.pixmap.isNull():
-            return None
-        return state.pixmap
+        pix = self._snapshot_cache.get(entry.path)
+        if pix is not None:
+            self._snapshot_cache.move_to_end(entry.path)
+            return pix
+        return None
 
     def has_key(self, path: Path) -> bool:
         return path in self._players
@@ -550,19 +546,26 @@ class VideoManager:
     def evict_paths(self, paths: set[Path]):
         """Actively stop and remove specific video players."""
         for p in paths:
+            self._snapshot_cache.pop(p, None)
+        for p in paths:
             state = self._players.pop(p, None)
             if state is not None:
-                self._dispose_state(state)
+                self._release_state(state, keep_snapshot=False)
+                self._available.append(state)
 
     def invalidate(self):
+        self._snapshot_cache.clear()
         for state in self._players.values():
-            self._dispose_state(state)
+            self._release_state(state, keep_snapshot=False)
+            self._available.append(state)
         self._players.clear()
 
-    def _on_frame_changed(self, entry: ImageEntry, frame: QVideoFrame):
-        key = entry.path
-        state = self._players.get(key)
-        if state is None or not frame.isValid():
+    def tracked_paths(self) -> set[Path]:
+        return set(self._players.keys()) | set(self._snapshot_cache.keys())
+
+    def _on_frame_changed(self, state: VideoState, frame: QVideoFrame):
+        entry = state.entry
+        if entry is None or self._players.get(entry.path) is not state or not frame.isValid():
             return
 
         image = frame.toImage()
@@ -574,29 +577,66 @@ class VideoManager:
 
         scaled = image.scaledToHeight(self._display_height, Qt.FastTransformation)
         state.pixmap = QPixmap.fromImage(scaled)
+        self._snapshot_cache[entry.path] = state.pixmap
+        self._snapshot_cache.move_to_end(entry.path)
+        self._evict_snapshots()
 
-    def _on_video_size_changed(self, entry: ImageEntry, size: QSize):
+    def _on_video_size_changed(self, state: VideoState, size: QSize):
+        entry = state.entry
+        if entry is None:
+            return
         if size.isValid() and entry.update_dimensions(size.width(), size.height(), self._display_height):
             self._on_dimensions_changed()
 
-    def _on_player_error(self, entry: ImageEntry):
-        state = self._players.get(entry.path)
-        if state is not None:
-            print(f"Video error for '{entry.path}': {state.player.errorString()}")
+    def _on_player_error(self, state: VideoState):
+        if state.entry is not None:
+            print(f"Video error for '{state.entry.path}': {state.player.errorString()}")
 
-    def _evict(self):
-        while len(self._players) > self.max_size:
-            _, state = self._players.popitem(last=False)
-            self._dispose_state(state)
-
-    def _dispose_state(self, state: VideoState):
-        """Release backend resources as aggressively as Qt allows."""
+    def _assign_state(self, state: VideoState, entry: ImageEntry):
+        state.entry = entry
         state.pixmap = QPixmap()
+        self._snapshot_cache.pop(entry.path, None)
         state.player.stop()
-        state.player.setVideoOutput(None)
         state.player.setSource(QUrl())
-        state.player.deleteLater()
-        state.sink.deleteLater()
+        state.player.setSource(QUrl.fromLocalFile(str(entry.path)))
+        if self._paused:
+            state.player.pause()
+        else:
+            state.player.play()
+
+    def _release_state(self, state: VideoState, keep_snapshot: bool = True):
+        """Stop playback and clear the assigned source without destroying the slot."""
+        if keep_snapshot and state.entry is not None and not state.pixmap.isNull():
+            self._snapshot_cache[state.entry.path] = state.pixmap
+            self._snapshot_cache.move_to_end(state.entry.path)
+            self._evict_snapshots()
+
+        state.player.stop()
+        state.player.setSource(QUrl())
+        state.entry = None
+        state.pixmap = QPixmap()
+
+    def _evict_snapshots(self):
+        max_snapshots = max(self.max_size * 3, 8)
+        while len(self._snapshot_cache) > max_snapshots:
+            self._snapshot_cache.popitem(last=False)
+
+    def _make_state(self) -> VideoState:
+        sink = QVideoSink(self._parent)
+        player = QMediaPlayer(self._parent)
+        state = VideoState(player, sink)
+        sink.videoFrameChanged.connect(
+            lambda frame, s=state: self._on_frame_changed(s, frame)
+        )
+        sink.videoSizeChanged.connect(
+            lambda size, s=state: self._on_video_size_changed(s, size)
+        )
+        player.errorOccurred.connect(
+            lambda *_args, s=state: self._on_player_error(s)
+        )
+        player.setVideoOutput(sink)
+        player.setLoops(QMediaPlayer.Loops.Infinite)
+        return state
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +656,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.gifs = GifManager(max_size=max(8, cache_size // 2))
         self.videos = VideoManager(
             self._handle_media_dimensions_changed,
-            max_size=max(2, min(4, cache_size // 4)),
+            max_size=1,
             parent=self,
         )
         self.prefetcher = PrefetchWorker()
@@ -900,7 +940,7 @@ class MarqueeWidget(QOpenGLWidget):
         to_evict: set[Path] = set()
         cached_paths = set(self.cache._cache.keys()) | set(self.cache._prefetched.keys())
         gif_paths = set(self.gifs._movies.keys())
-        video_paths = set(self.videos._players.keys())
+        video_paths = self.videos.tracked_paths()
         all_cached = cached_paths | gif_paths | video_paths
 
         if not all_cached:
@@ -943,20 +983,13 @@ class MarqueeWidget(QOpenGLWidget):
             candidates.append((distance, entry))
 
         if not candidates:
-            if self.videos._players:
-                self.videos.evict_paths(set(self.videos._players.keys()))
+            if self.videos.tracked_paths():
+                self.videos.invalidate()
             return
 
         candidates.sort(key=lambda item: item[0])
         desired_entries = [entry for _distance, entry in candidates[:self.videos.max_size]]
-        desired_paths = {entry.path for entry in desired_entries}
-
-        stale_paths = set(self.videos._players.keys()) - desired_paths
-        if stale_paths:
-            self.videos.evict_paths(stale_paths)
-
-        for entry in desired_entries:
-            self.videos.ensure_loaded(entry)
+        self.videos.set_active_entries(desired_entries)
 
     def _request_prefetch(self):
         """Identify images approaching the viewport using binary search."""
@@ -1055,7 +1088,7 @@ class MarqueeWidget(QOpenGLWidget):
                 f"pix:{len(self.cache._cache)}/{self.cache.max_size}"
                 f"  pre:{len(self.cache._prefetched)}"
                 f"  gif:{len(self.gifs._movies)}"
-                f"  vid:{len(self.videos._players)}"
+                f"  vid:{self.videos.active_count}"
                 f"  pf:{self.prefetcher.pending_count}"
             )
             stats_text = "\n".join(lines)
