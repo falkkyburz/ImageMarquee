@@ -6,7 +6,7 @@ Usage:
     python image_marquee.py [OPTIONS]
 
 Options:
-    -p, --path PATH     Path to image folder (default: open dialog)
+    -p, --path PATH     Path to media folder (default: open dialog)
     -v, --speed FLOAT   Scroll speed in pixels/sec (default: 120.0)
     -g, --gap INT       Gap between images in pixels (default: 20)
     -H, --height INT    Image display height in pixels (default: 0 = auto/fullscreen)
@@ -49,40 +49,66 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QLabel,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt, QTimer, QElapsedTimer, Signal
+from PySide6.QtCore import Qt, QSize, QTimer, QElapsedTimer, Signal, QUrl
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QKeyEvent, QFont,
     QPen, QImageReader, QSurfaceFormat, QMovie, QIcon
 )
+from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".mp4"}
 
 # Threshold above which we skip smooth upgrades (images fly by too fast to notice)
 SMOOTH_SPEED_THRESHOLD = 350.0  # px/s
 
 
 GIF_EXTENSIONS = {".gif"}
+VIDEO_EXTENSIONS = {".mp4"}
+DEFAULT_VIDEO_ASPECT_RATIO = 16 / 9
 
 
 class ImageEntry:
     """Metadata for one image in the strip, loaded cheaply via QImageReader."""
 
-    __slots__ = ("path", "original_width", "original_height", "scaled_width", "is_gif")
+    __slots__ = ("path", "original_width", "original_height", "scaled_width", "is_gif", "is_video")
 
     def __init__(self, path: Path, display_height: int):
         self.path = path
         self.is_gif = path.suffix.lower() in GIF_EXTENSIONS
-        reader = QImageReader(str(path))
-        size = reader.size()
-        if size.isValid():
-            self.original_width = size.width()
-            self.original_height = size.height()
-            scale = display_height / self.original_height if self.original_height > 0 else 1.0
-            self.scaled_width = max(1, int(self.original_width * scale))
+        self.is_video = path.suffix.lower() in VIDEO_EXTENSIONS
+        if self.is_video:
+            self.original_width = max(1, int(DEFAULT_VIDEO_ASPECT_RATIO * display_height))
+            self.original_height = display_height
+            self.scaled_width = self.original_width
         else:
-            self.original_width = 0
-            self.original_height = 0
-            self.scaled_width = 0
+            reader = QImageReader(str(path))
+            size = reader.size()
+            if size.isValid():
+                self.original_width = size.width()
+                self.original_height = size.height()
+                scale = display_height / self.original_height if self.original_height > 0 else 1.0
+                self.scaled_width = max(1, int(self.original_width * scale))
+            else:
+                self.original_width = 0
+                self.original_height = 0
+                self.scaled_width = 0
+
+    def update_dimensions(self, width: int, height: int, display_height: int) -> bool:
+        """Update media dimensions when the real size becomes known."""
+        if width <= 0 or height <= 0:
+            return False
+
+        scale = display_height / height if height > 0 else 1.0
+        scaled_width = max(1, int(width * scale))
+        changed = (
+            self.original_width != width
+            or self.original_height != height
+            or self.scaled_width != scaled_width
+        )
+        self.original_width = width
+        self.original_height = height
+        self.scaled_width = scaled_width
+        return changed
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +423,6 @@ class GifManager:
             )
             # Compute scaled size from original dimensions
             if entry.original_height > 0:
-                from PySide6.QtCore import QSize
                 scale = self._display_height / entry.original_height
                 w = max(1, int(entry.original_width * scale))
                 movie.setScaledSize(QSize(w, self._display_height))
@@ -437,12 +462,133 @@ class GifManager:
             movie.stop()
 
 
+class VideoState:
+    """Playback state for one lazily-loaded video."""
+
+    __slots__ = ("player", "sink", "pixmap")
+
+    def __init__(self, player: QMediaPlayer, sink: QVideoSink):
+        self.player = player
+        self.sink = sink
+        self.pixmap = QPixmap()
+
+
+class VideoManager:
+    """Manages QMediaPlayer instances for looping inline videos."""
+
+    def __init__(self, on_dimensions_changed, max_size: int = 16, parent=None):
+        self.max_size = max(2, max_size)
+        self._players: OrderedDict[Path, VideoState] = OrderedDict()
+        self._display_height: int = 600
+        self._paused: bool = False
+        self._parent = parent
+        self._on_dimensions_changed = on_dimensions_changed
+
+    def set_display_height(self, h: int):
+        if h != self._display_height:
+            self._display_height = h
+            self.invalidate()
+
+    def get_frame(self, entry: ImageEntry) -> QPixmap | None:
+        """Get the most recent decoded frame as a scaled QPixmap."""
+        key = entry.path
+
+        if key in self._players:
+            self._players.move_to_end(key)
+            state = self._players[key]
+        else:
+            sink = QVideoSink(self._parent)
+            player = QMediaPlayer(self._parent)
+            state = VideoState(player, sink)
+
+            sink.videoFrameChanged.connect(
+                lambda frame, e=entry: self._on_frame_changed(e, frame)
+            )
+            sink.videoSizeChanged.connect(
+                lambda size, e=entry: self._on_video_size_changed(e, size)
+            )
+            player.errorOccurred.connect(
+                lambda *_args, e=entry: self._on_player_error(e)
+            )
+
+            player.setVideoOutput(sink)
+            player.setLoops(QMediaPlayer.Loops.Infinite)
+            player.setSource(QUrl.fromLocalFile(str(entry.path)))
+            if self._paused:
+                player.pause()
+            else:
+                player.play()
+
+            self._players[key] = state
+            self._evict()
+
+        if state.pixmap.isNull():
+            return None
+        return state.pixmap
+
+    def set_paused(self, paused: bool):
+        self._paused = paused
+        for state in self._players.values():
+            if paused:
+                state.player.pause()
+            else:
+                state.player.play()
+
+    def evict_paths(self, paths: set[Path]):
+        """Actively stop and remove specific video players."""
+        for p in paths:
+            state = self._players.pop(p, None)
+            if state is not None:
+                state.player.stop()
+                state.player.deleteLater()
+                state.sink.deleteLater()
+
+    def invalidate(self):
+        for state in self._players.values():
+            state.player.stop()
+            state.player.deleteLater()
+            state.sink.deleteLater()
+        self._players.clear()
+
+    def _on_frame_changed(self, entry: ImageEntry, frame: QVideoFrame):
+        key = entry.path
+        state = self._players.get(key)
+        if state is None or not frame.isValid():
+            return
+
+        image = frame.toImage()
+        if image.isNull():
+            return
+
+        if entry.update_dimensions(image.width(), image.height(), self._display_height):
+            self._on_dimensions_changed()
+
+        scaled = image.scaledToHeight(self._display_height, Qt.FastTransformation)
+        state.pixmap = QPixmap.fromImage(scaled)
+
+    def _on_video_size_changed(self, entry: ImageEntry, size: QSize):
+        if size.isValid() and entry.update_dimensions(size.width(), size.height(), self._display_height):
+            self._on_dimensions_changed()
+
+    def _on_player_error(self, entry: ImageEntry):
+        state = self._players.get(entry.path)
+        if state is not None:
+            print(f"Video error for '{entry.path}': {state.player.errorString()}")
+
+    def _evict(self):
+        while len(self._players) > self.max_size:
+            _, state = self._players.popitem(last=False)
+            state.player.stop()
+            state.player.deleteLater()
+            state.sink.deleteLater()
+
+
 # ---------------------------------------------------------------------------
 # Main marquee widget
 # ---------------------------------------------------------------------------
 
 class MarqueeWidget(QOpenGLWidget):
-    """GPU-composited widget that scrolls images using delta-time animation
+    """GPU-composited widget that scrolls media using delta-time animation
     with background prefetching for stutter-free rendering."""
 
     speed_changed = Signal(float)
@@ -452,6 +598,11 @@ class MarqueeWidget(QOpenGLWidget):
         self.entries: list[ImageEntry] = []
         self.cache = PixmapCache(max_size=cache_size)
         self.gifs = GifManager(max_size=max(8, cache_size // 2))
+        self.videos = VideoManager(
+            self._handle_media_dimensions_changed,
+            max_size=max(4, cache_size // 4),
+            parent=self,
+        )
         self.prefetcher = PrefetchWorker()
         self.scanner = FolderScanner()
         self.prefetch_px: int = prefetch_px
@@ -481,7 +632,7 @@ class MarqueeWidget(QOpenGLWidget):
         self._frame_count: int = 0
         self._fps_accum_ns: int = 0
         self._current_fps: float = 0.0
-        self._has_gifs: bool = False
+        self._has_animated_media: bool = False
         self._tick_count: int = 0
 
     @property
@@ -490,7 +641,7 @@ class MarqueeWidget(QOpenGLWidget):
         return h if h > 0 else 600
 
     def scan_folder(self, folder: str, shuffle: bool = False, recursive: bool = False):
-        """Start scanning for image files in a background thread."""
+        """Start scanning for media files in a background thread."""
         folder_path = Path(folder)
         if not folder_path.is_dir():
             print(f"Warning: '{folder}' is not a valid directory.")
@@ -518,11 +669,13 @@ class MarqueeWidget(QOpenGLWidget):
         self.prefetcher.clear()
         self.cache.invalidate()
         self.gifs.invalidate()
+        self.videos.invalidate()
         self.gifs.set_display_height(self.display_height)
+        self.videos.set_display_height(self.display_height)
         self._positions.clear()
         self._total_width = 0
         self.scroll_offset = 0.0
-        self._has_gifs = False
+        self._has_animated_media = False
         self._scan_folder_str = folder
 
         # Kick off background scanning
@@ -555,7 +708,9 @@ class MarqueeWidget(QOpenGLWidget):
         self.prefetcher.clear()
         self.cache.invalidate()
         self.gifs.invalidate()
+        self.videos.invalidate()
         self.gifs.set_display_height(dh)
+        self.videos.set_display_height(dh)
         self._rebuild_positions()
 
     def start(self):
@@ -568,6 +723,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.timer.stop()
         self.prefetcher.stop()
         self.gifs.invalidate()
+        self.videos.invalidate()
 
     def set_speed(self, speed: float):
         self.speed = max(1.0, speed)
@@ -576,8 +732,14 @@ class MarqueeWidget(QOpenGLWidget):
     def toggle_pause(self):
         self.paused = not self.paused
         self.gifs.set_paused(self.paused)
+        self.videos.set_paused(self.paused)
         if not self.paused:
             self._last_time_ns = self._clock.nsecsElapsed()
+
+    def _handle_media_dimensions_changed(self):
+        self._rebuild_positions()
+        self._wrap_offset()
+        self.update()
 
     # ----- per-tick logic -----
 
@@ -608,11 +770,11 @@ class MarqueeWidget(QOpenGLWidget):
         if scanned:
             for entry in scanned:
                 self.entries.append(entry)
-                if entry.is_gif:
-                    self._has_gifs = True
+                if entry.is_gif or entry.is_video:
+                    self._has_animated_media = True
             self._append_positions(scanned)
             if not self.scanner.is_scanning:
-                print(f"Scanned {len(self.entries)} images from '{self._scan_folder_str}'")
+                print(f"Scanned {len(self.entries)} media files from '{self._scan_folder_str}'")
 
         # Ingest any prefetched images from the background thread
         prefetched = self.prefetcher.collect()
@@ -635,8 +797,8 @@ class MarqueeWidget(QOpenGLWidget):
 
         self._tick_count += 1
 
-        # Only repaint if something changed (GIFs always need repainting for animation)
-        if moved or has_new or upgraded or self._has_gifs or scanned:
+        # Only repaint if something changed (animated media always needs repainting)
+        if moved or has_new or upgraded or self._has_animated_media or scanned:
             self.update()
 
     def _wrap_offset(self):
@@ -700,7 +862,8 @@ class MarqueeWidget(QOpenGLWidget):
         to_evict: set[Path] = set()
         cached_paths = set(self.cache._cache.keys()) | set(self.cache._prefetched.keys())
         gif_paths = set(self.gifs._movies.keys())
-        all_cached = cached_paths | gif_paths
+        video_paths = set(self.videos._players.keys())
+        all_cached = cached_paths | gif_paths | video_paths
 
         if not all_cached:
             return
@@ -713,6 +876,7 @@ class MarqueeWidget(QOpenGLWidget):
         if to_evict:
             self.cache.evict_paths(to_evict)
             self.gifs.evict_paths(to_evict)
+            self.videos.evict_paths(to_evict)
             self.prefetcher.discard_paths(to_evict)
 
     def _request_prefetch(self):
@@ -742,7 +906,7 @@ class MarqueeWidget(QOpenGLWidget):
                 entry = self.entries[i]
                 p = self._positions[i] + offset
                 if p + entry.scaled_width >= fetch_left and p <= fetch_right:
-                    if not entry.is_gif and not self.cache.has_key(entry.path):
+                    if not entry.is_gif and not entry.is_video and not self.cache.has_key(entry.path):
                         to_prefetch.append(entry)
 
         if to_prefetch:
@@ -763,7 +927,7 @@ class MarqueeWidget(QOpenGLWidget):
             painter.setFont(font)
             painter.drawText(
                 self.rect(), Qt.AlignCenter,
-                "No images loaded.\nPress O to open a folder  ·  H for help"
+                "No media loaded.\nPress O to open a folder  ·  H for help"
             )
             painter.end()
             return
@@ -796,9 +960,11 @@ class MarqueeWidget(QOpenGLWidget):
                 if img_x > widget_w:
                     break
 
-                # Use GifManager for animated GIFs, PixmapCache for statics
+                # GIFs and videos have their own live playback managers.
                 if entry.is_gif:
                     pix = self.gifs.get_frame(entry)
+                elif entry.is_video:
+                    pix = self.videos.get_frame(entry)
                 else:
                     pix = self.cache.get(entry, dh)
                 if pix is not None:
@@ -814,6 +980,7 @@ class MarqueeWidget(QOpenGLWidget):
                 f"pix:{len(self.cache._cache)}/{self.cache.max_size}"
                 f"  pre:{len(self.cache._prefetched)}"
                 f"  gif:{len(self.gifs._movies)}"
+                f"  vid:{len(self.videos._players)}"
                 f"  pf:{self.prefetcher.pending_count}"
             )
             stats_text = "\n".join(lines)
@@ -979,7 +1146,7 @@ class MainWindow(QMainWindow):
         self.marquee.start()
 
     def _open_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        folder = QFileDialog.getExistingDirectory(self, "Select Media Folder")
         if folder:
             self.image_folder = folder
             self.marquee.scan_folder(folder, shuffle=self.shuffle, recursive=self.recursive)
@@ -1102,7 +1269,7 @@ def parse_args():
     )
     parser.add_argument(
         "-p", "--path", type=str, default="",
-        help="Path to folder containing images (default: open dialog)"
+        help="Path to folder containing images/videos (default: open dialog)"
     )
     parser.add_argument(
         "-v", "--speed", type=float, default=120.0,
@@ -1130,11 +1297,11 @@ def parse_args():
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true",
-        help="Scan subfolders recursively for images"
+        help="Scan subfolders recursively for images/videos"
     )
     parser.add_argument(
         "-s", "--shuffle", action="store_true",
-        help="Shuffle image order on load"
+        help="Shuffle media order on load"
     )
     parser.add_argument(
         "-F", "--fullscreen", action="store_true",
