@@ -44,6 +44,7 @@ import bisect
 import threading
 import subprocess
 import time
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -325,28 +326,24 @@ class VideoPreviewWorker:
 
 
 class FolderScanner:
-    """Background thread that probes image dimensions via QImageReader.
-
-    Produces ImageEntry objects in batches without blocking the GUI thread.
-    The main thread polls collect() each tick to ingest completed entries.
-    """
+    """Background worker that discovers files and probes media dimensions."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._files: list[Path] = []
-        self._display_height: int = 600
+        self._pending_scan: tuple[int, Path, int, bool, bool] | None = None
         self._results: list[ImageEntry] = []
         self._scanning: bool = False
+        self._job_id: int = 0
         self._stop = threading.Event()
         self._work = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def start_scan(self, files: list[Path], display_height: int):
-        """Begin scanning a new set of files. Cancels any in-progress scan."""
+    def start_scan(self, folder: Path, display_height: int, shuffle: bool = False, recursive: bool = False):
+        """Begin scanning a folder. Cancels any in-progress scan."""
         with self._lock:
-            self._files = list(files)
-            self._display_height = display_height
+            self._job_id += 1
+            self._pending_scan = (self._job_id, folder, display_height, shuffle, recursive)
             self._results.clear()
             self._scanning = True
         self._work.set()
@@ -367,7 +364,8 @@ class FolderScanner:
 
     def cancel(self):
         with self._lock:
-            self._files.clear()
+            self._job_id += 1
+            self._pending_scan = None
             self._results.clear()
             self._scanning = False
 
@@ -382,26 +380,84 @@ class FolderScanner:
             self._work.clear()
 
             while not self._stop.is_set():
-                # Grab a small batch of files
                 with self._lock:
-                    if not self._files:
-                        self._scanning = False
+                    scan = self._pending_scan
+                    self._pending_scan = None
+                    if scan is None:
                         break
-                    batch = self._files[:20]
-                    self._files = self._files[20:]
-                    dh = self._display_height
+                job_id, folder, dh, shuffle, recursive = scan
+                self._scan_folder(job_id, folder, dh, shuffle, recursive)
 
-                # Probe dimensions off the GUI thread
-                entries = []
-                for f in batch:
-                    if self._stop.is_set():
-                        return
-                    entry = ImageEntry(f, dh)
-                    if entry.scaled_width > 0:
-                        entries.append(entry)
+    def _scan_folder(self, job_id: int, folder: Path, display_height: int, shuffle: bool, recursive: bool):
+        if shuffle:
+            files = list(self._iter_media_files(folder, recursive, job_id))
+            if not self._is_job_active(job_id):
+                return
+            random.shuffle(files)
+            file_iter = iter(files)
+        else:
+            file_iter = self._iter_media_files(folder, recursive, job_id)
 
-                with self._lock:
-                    self._results.extend(entries)
+        batch: list[ImageEntry] = []
+        for media_path in file_iter:
+            if self._stop.is_set() or not self._is_job_active(job_id):
+                return
+
+            entry = ImageEntry(media_path, display_height)
+            if entry.scaled_width <= 0:
+                continue
+
+            batch.append(entry)
+            if len(batch) >= 20:
+                if not self._publish_batch(job_id, batch):
+                    return
+                batch = []
+
+        if batch and not self._publish_batch(job_id, batch):
+            return
+        self._finish_scan(job_id)
+
+    def _iter_media_files(self, folder: Path, recursive: bool, job_id: int):
+        stack = [folder]
+        while stack:
+            if self._stop.is_set() or not self._is_job_active(job_id):
+                return
+
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    entries = sorted(it, key=lambda entry: entry.name.lower())
+            except OSError:
+                continue
+
+            for dir_entry in entries:
+                if self._stop.is_set() or not self._is_job_active(job_id):
+                    return
+                try:
+                    if dir_entry.is_file(follow_symlinks=False):
+                        path = Path(dir_entry.path)
+                        if path.suffix.lower() in IMAGE_EXTENSIONS:
+                            yield path
+                    elif recursive and dir_entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(dir_entry.path))
+                except OSError:
+                    continue
+
+    def _is_job_active(self, job_id: int) -> bool:
+        with self._lock:
+            return self._scanning and self._job_id == job_id
+
+    def _publish_batch(self, job_id: int, batch: list[ImageEntry]) -> bool:
+        with self._lock:
+            if not self._scanning or self._job_id != job_id:
+                return False
+            self._results.extend(batch)
+        return True
+
+    def _finish_scan(self, job_id: int):
+        with self._lock:
+            if self._job_id == job_id:
+                self._scanning = False
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +995,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.videos.set_capacity(self._target_video_pool_size())
 
     def scan_folder(self, folder: str, shuffle: bool = False, recursive: bool = False):
-        """Start scanning for media files in a background thread."""
+        """Start scanning for media files without blocking the GUI thread."""
         folder_path = Path(folder)
         if not folder_path.is_dir():
             print(f"Warning: '{folder}' is not a valid directory.")
@@ -947,20 +1003,6 @@ class MarqueeWidget(QOpenGLWidget):
 
         # Cancel any in-progress scan
         self.scanner.cancel()
-
-        if recursive:
-            files = sorted(
-                f for f in folder_path.rglob("*")
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-            )
-        else:
-            files = sorted(
-                f for f in folder_path.iterdir()
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-            )
-
-        if shuffle:
-            random.shuffle(files)
 
         # Reset state
         self.entries.clear()
@@ -978,7 +1020,7 @@ class MarqueeWidget(QOpenGLWidget):
         self._scan_folder_str = folder
 
         # Kick off background scanning
-        self.scanner.start_scan(files, self.display_height)
+        self.scanner.start_scan(folder_path, self.display_height, shuffle=shuffle, recursive=recursive)
         self.update()
 
     def _rebuild_positions(self):
