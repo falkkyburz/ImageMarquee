@@ -67,6 +67,8 @@ SMOOTH_SPEED_THRESHOLD = 350.0  # px/s
 GIF_EXTENSIONS = {".gif"}
 VIDEO_EXTENSIONS = {".mp4"}
 DEFAULT_VIDEO_ASPECT_RATIO = 16 / 9
+MIN_VIDEO_PLAYER_POOL_SIZE = 2
+MAX_VIDEO_PLAYER_POOL_SIZE = 6
 
 
 class ImageEntry:
@@ -618,6 +620,26 @@ class VideoManager:
             self._display_height = h
             self.invalidate()
 
+    def set_capacity(self, capacity: int):
+        capacity = max(1, capacity)
+        if capacity == self.max_size:
+            return
+
+        while len(self._players) > capacity:
+            _path, state = self._players.popitem(last=False)
+            self._release_state(state, keep_snapshot=True)
+            self._available.append(state)
+
+        while len(self._players) + len(self._available) > capacity and self._available:
+            state = self._available.pop()
+            self._destroy_state(state)
+
+        while len(self._players) + len(self._available) < capacity:
+            self._available.append(self._make_state())
+
+        self.max_size = capacity
+        self._evict_snapshots()
+
     def set_active_entries(self, entries: list[ImageEntry]):
         """Retarget the fixed player pool to the requested nearby videos."""
         desired_paths = {entry.path for entry in entries}
@@ -777,6 +799,12 @@ class VideoManager:
         player.setLoops(QMediaPlayer.Loops.Infinite)
         return state
 
+    def _destroy_state(self, state: VideoState):
+        state.player.stop()
+        state.player.setSource(QUrl())
+        state.player.deleteLater()
+        state.sink.deleteLater()
+
     def _on_position_changed(self, state: VideoState, position: int):
         if state.entry is None:
             return
@@ -861,7 +889,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.gifs = GifManager(max_size=max(8, cache_size // 2))
         self.videos = VideoManager(
             self._handle_media_dimensions_changed,
-            max_size=1,
+            max_size=MIN_VIDEO_PLAYER_POOL_SIZE,
             parent=self,
         )
         self.prefetcher = PrefetchWorker()
@@ -901,6 +929,15 @@ class MarqueeWidget(QOpenGLWidget):
         h = self.target_height if self.target_height > 0 else self.height()
         return h if h > 0 else 600
 
+    def _target_video_pool_size(self) -> int:
+        estimated_video_width = max(240, int(self.display_height * 0.9))
+        visible_slots = max(1, (max(1, self.width()) + estimated_video_width - 1) // estimated_video_width)
+        desired = visible_slots + 1  # one extra slot for the next entering video
+        return max(MIN_VIDEO_PLAYER_POOL_SIZE, min(MAX_VIDEO_PLAYER_POOL_SIZE, desired))
+
+    def _sync_video_pool_size(self):
+        self.videos.set_capacity(self._target_video_pool_size())
+
     def scan_folder(self, folder: str, shuffle: bool = False, recursive: bool = False):
         """Start scanning for media files in a background thread."""
         folder_path = Path(folder)
@@ -931,6 +968,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.cache.invalidate()
         self.gifs.invalidate()
         self.videos.invalidate()
+        self._sync_video_pool_size()
         self.gifs.set_display_height(self.display_height)
         self.videos.set_display_height(self.display_height)
         self._positions.clear()
@@ -970,6 +1008,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.cache.invalidate()
         self.gifs.invalidate()
         self.videos.invalidate()
+        self._sync_video_pool_size()
         self.gifs.set_display_height(dh)
         self.videos.set_display_height(dh)
         self._rebuild_positions()
@@ -1123,11 +1162,14 @@ class MarqueeWidget(QOpenGLWidget):
         return view_left - self.prefetch_px, view_right + self.width()
 
     def _video_active_range(self) -> tuple[float, float]:
-        """Much tighter range for live video players to avoid backend bloat."""
+        """Bounded live range for the reusable video player pool."""
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
-        margin = max(120, min(self.prefetch_px // 8, self.width() // 6))
-        return view_left - margin, view_right + margin
+        leading_margin = max(self.width() // 2, self.display_height)
+        trailing_margin = max(self.width() // 3, self.display_height // 2)
+        if self.direction == -1:
+            return view_left - trailing_margin, view_right + leading_margin
+        return view_left - leading_margin, view_right + trailing_margin
 
     def _reap_behind(self):
         """Evict cached images outside the keep zone using binary search."""
@@ -1470,6 +1512,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.marquee._sync_video_pool_size()
         if self.marquee.target_height == 0 and self.marquee.entries:
             self.marquee.recompute_layout()
         self.help_overlay._reposition()
