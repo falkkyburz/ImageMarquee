@@ -45,6 +45,7 @@ import threading
 import subprocess
 import time
 import os
+import shutil
 from collections import OrderedDict
 from pathlib import Path
 
@@ -73,8 +74,61 @@ MIN_VIDEO_PLAYER_POOL_SIZE = 2
 MAX_VIDEO_PLAYER_POOL_SIZE = 10
 VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
 VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
-VIDEO_ASSIGN_INTERVAL_TICKS = 6
+VIDEO_ASSIGN_INTERVAL_TICKS = 12
 MAX_SIMULTANEOUS_PLAYING_VIDEOS = 10
+FFPROBE_BIN = shutil.which("ffprobe")
+VIDEO_PROBE_TIMEOUT_SEC = 0.9
+_VIDEO_DIMENSIONS_CACHE: dict[Path, tuple[int, int] | None] = {}
+_VIDEO_DIMENSIONS_LOCK = threading.Lock()
+
+
+def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Best-effort metadata probe for video width/height, cached per path."""
+    if FFPROBE_BIN is None:
+        return None
+
+    with _VIDEO_DIMENSIONS_LOCK:
+        cached = _VIDEO_DIMENSIONS_CACHE.get(path)
+        if cached is not None:
+            return cached
+
+    cmd = [
+        FFPROBE_BIN,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=VIDEO_PROBE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+
+    dims: tuple[int, int] | None = None
+    if result is not None and result.returncode == 0 and result.stdout:
+        raw = result.stdout.decode("utf-8", errors="ignore").strip()
+        if raw:
+            first = raw.splitlines()[0].strip()
+            parts = first.split("x", 1)
+            if len(parts) == 2:
+                try:
+                    w = int(parts[0])
+                    h = int(parts[1])
+                    if w > 0 and h > 0:
+                        dims = (w, h)
+                except ValueError:
+                    dims = None
+
+    with _VIDEO_DIMENSIONS_LOCK:
+        _VIDEO_DIMENSIONS_CACHE[path] = dims
+    return dims
 
 
 class ImageEntry:
@@ -87,9 +141,14 @@ class ImageEntry:
         self.is_gif = path.suffix.lower() in GIF_EXTENSIONS
         self.is_video = path.suffix.lower() in VIDEO_EXTENSIONS
         if self.is_video:
-            self.original_width = max(1, int(DEFAULT_VIDEO_ASPECT_RATIO * display_height))
-            self.original_height = display_height
-            self.scaled_width = self.original_width
+            dims = probe_video_dimensions(path)
+            if dims is None:
+                self.original_width = max(1, int(DEFAULT_VIDEO_ASPECT_RATIO * display_height))
+                self.original_height = display_height
+            else:
+                self.original_width, self.original_height = dims
+            scale = display_height / self.original_height if self.original_height > 0 else 1.0
+            self.scaled_width = max(1, int(self.original_width * scale))
         else:
             reader = QImageReader(str(path))
             size = reader.size()
@@ -1333,10 +1392,8 @@ class MarqueeWidget(QOpenGLWidget):
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
 
-        active_paths = self.videos.active_paths()
-        sticky_bonus = max(self.width() // 2, self.display_height // 2)
-        candidates: list[tuple[tuple[int, float], ImageEntry]] = []
-        playing_candidates: list[tuple[float, ImageEntry]] = []
+        # One candidate per path, choosing whichever wrapped instance is best.
+        candidate_map: dict[Path, tuple[tuple[int, float], float, bool, ImageEntry]] = {}
         for i, p in self._iter_wrapped_items(unload_left, unload_right):
             entry = self.entries[i]
             if not entry.is_video:
@@ -1352,30 +1409,51 @@ class MarqueeWidget(QOpenGLWidget):
                 distance = 0.0
 
             in_active = (item_right >= active_left and item_left <= active_right)
-            if entry.path in active_paths:
-                distance = max(0.0, distance - sticky_bonus)
             score = (0 if in_active else 1, distance)
-            candidates.append((score, entry))
-            if in_active:
-                playing_candidates.append((distance, entry))
+            existing = candidate_map.get(entry.path)
+            if existing is None or score < existing[0]:
+                candidate_map[entry.path] = (score, distance, in_active, entry)
 
-        if not candidates:
+        if not candidate_map:
             if self.videos.tracked_paths():
                 self.videos.invalidate()
             return
 
-        candidates.sort(key=lambda item: item[0])
-        desired_entries = [entry for _score, entry in candidates[:self.videos.max_size]]
+        current_active = self.videos.active_paths()
+        desired_paths: list[Path] = []
+
+        # Keep already active paths as long as they remain in unload range.
+        kept_paths = [path for path in current_active if path in candidate_map]
+        kept_paths.sort(key=lambda path: candidate_map[path][0])
+        desired_paths.extend(kept_paths[:self.videos.max_size])
+
+        if len(desired_paths) < self.videos.max_size:
+            newcomer_paths = [
+                path
+                for path, (score, _distance, _in_active, _entry) in sorted(
+                    candidate_map.items(),
+                    key=lambda item: item[1][0],
+                )
+                if path not in current_active
+            ]
+            desired_paths.extend(newcomer_paths[: self.videos.max_size - len(desired_paths)])
+
+        desired_entries = [candidate_map[path][3] for path in desired_paths]
         self.videos.set_active_entries(desired_entries)
-        if playing_candidates:
-            playing_candidates.sort(key=lambda item: item[0])
+
+        playing_ranked = [
+            (candidate_map[path][1], path)
+            for path in desired_paths
+            if candidate_map[path][2]
+        ]
+        if playing_ranked:
+            playing_ranked.sort(key=lambda item: item[0])
             playing_paths = {
-                entry.path
-                for _distance, entry in playing_candidates[:MAX_SIMULTANEOUS_PLAYING_VIDEOS]
+                path for _distance, path in playing_ranked[:MAX_SIMULTANEOUS_PLAYING_VIDEOS]
             }
         else:
             # If nothing is inside active range, keep one nearest loaded video warm.
-            playing_paths = {desired_entries[0].path} if desired_entries else set()
+            playing_paths = {desired_paths[0]} if desired_paths else set()
         self.videos.set_playing_paths(playing_paths)
 
     def _request_prefetch(self):
