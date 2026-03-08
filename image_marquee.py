@@ -72,6 +72,8 @@ MIN_VIDEO_PLAYER_POOL_SIZE = 2
 MAX_VIDEO_PLAYER_POOL_SIZE = 10
 VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
 VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
+VIDEO_ASSIGN_INTERVAL_TICKS = 6
+MAX_SIMULTANEOUS_PLAYING_VIDEOS = 3
 
 
 class ImageEntry:
@@ -669,6 +671,7 @@ class VideoManager:
         self._on_dimensions_changed = on_dimensions_changed
         self._snapshot_cache: OrderedDict[Path, QPixmap] = OrderedDict()
         self._timelines: dict[Path, VideoTimeline] = {}
+        self._playing_paths: set[Path] = set()
 
         for _ in range(self.max_size):
             self._available.append(self._make_state())
@@ -747,13 +750,13 @@ class VideoManager:
             for state in self._players.values():
                 self._capture_timeline(state, now_ms)
         self._paused = paused
-        for state in self._players.values():
-            if paused:
-                state.player.pause()
-            else:
-                state.player.play()
+        self._apply_playback_states()
         if not paused:
             self._resync_timelines(now_ms)
+
+    def set_playing_paths(self, paths: set[Path]):
+        self._playing_paths = set(paths)
+        self._apply_playback_states()
 
     def evict_paths(self, paths: set[Path]):
         """Actively stop and remove specific video players."""
@@ -767,6 +770,7 @@ class VideoManager:
 
     def invalidate(self):
         self._snapshot_cache.clear()
+        self._playing_paths.clear()
         for state in self._players.values():
             self._release_state(state, keep_snapshot=False)
             self._available.append(state)
@@ -822,6 +826,8 @@ class VideoManager:
             self._snapshot_cache.move_to_end(state.entry.path)
             self._evict_snapshots()
 
+        if state.entry is not None:
+            self._playing_paths.discard(state.entry.path)
         self._capture_timeline(state, self._now_ms())
         self._prune_timelines()
         state.player.stop()
@@ -905,10 +911,10 @@ class VideoManager:
         if state.pending_seek_ms is not None:
             state.player.setPosition(state.pending_seek_ms)
             state.pending_seek_ms = None
-        if self._paused:
-            state.player.pause()
-        else:
+        if self._should_play(state.entry.path):
             state.player.play()
+        else:
+            state.player.pause()
 
     def _timeline_for(self, path: Path) -> VideoTimeline:
         timeline = self._timelines.get(path)
@@ -942,6 +948,16 @@ class VideoManager:
     def _resync_timelines(self, now_ms: int):
         for timeline in self._timelines.values():
             timeline.timestamp_ms = now_ms
+
+    def _should_play(self, path: Path) -> bool:
+        return (not self._paused) and (path in self._playing_paths)
+
+    def _apply_playback_states(self):
+        for path, state in self._players.items():
+            if self._should_play(path):
+                state.player.play()
+            else:
+                state.player.pause()
 
     def _now_ms(self) -> int:
         return time.monotonic_ns() // 1_000_000
@@ -1152,7 +1168,11 @@ class MarqueeWidget(QOpenGLWidget):
         if self.entries and self._tick_count % 4 == 0:
             self._request_prefetch()
 
-        if self.entries:
+        if self.entries and (
+            scanned
+            or moved
+            or self._tick_count % VIDEO_ASSIGN_INTERVAL_TICKS == 0
+        ):
             self._ensure_nearby_videos_loaded()
 
         # Smooth-upgrade one image per tick (skip at high speed)
@@ -1310,6 +1330,7 @@ class MarqueeWidget(QOpenGLWidget):
         active_paths = self.videos.active_paths()
         sticky_bonus = max(self.width() // 2, self.display_height // 2)
         candidates: list[tuple[tuple[int, float], ImageEntry]] = []
+        playing_candidates: list[tuple[float, ImageEntry]] = []
         for i, p in self._iter_wrapped_items(unload_left, unload_right):
             entry = self.entries[i]
             if not entry.is_video:
@@ -1329,6 +1350,8 @@ class MarqueeWidget(QOpenGLWidget):
                 distance = max(0.0, distance - sticky_bonus)
             score = (0 if in_active else 1, distance)
             candidates.append((score, entry))
+            if in_active:
+                playing_candidates.append((distance, entry))
 
         if not candidates:
             if self.videos.tracked_paths():
@@ -1338,6 +1361,16 @@ class MarqueeWidget(QOpenGLWidget):
         candidates.sort(key=lambda item: item[0])
         desired_entries = [entry for _score, entry in candidates[:self.videos.max_size]]
         self.videos.set_active_entries(desired_entries)
+        if playing_candidates:
+            playing_candidates.sort(key=lambda item: item[0])
+            playing_paths = {
+                entry.path
+                for _distance, entry in playing_candidates[:MAX_SIMULTANEOUS_PLAYING_VIDEOS]
+            }
+        else:
+            # If nothing is inside active range, keep one nearest loaded video warm.
+            playing_paths = {desired_entries[0].path} if desired_entries else set()
+        self.videos.set_playing_paths(playing_paths)
 
     def _request_prefetch(self):
         """Identify images approaching the viewport using binary search."""
