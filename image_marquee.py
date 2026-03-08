@@ -70,16 +70,17 @@ SMOOTH_SPEED_THRESHOLD = 350.0  # px/s
 
 GIF_EXTENSIONS = {".gif"}
 VIDEO_EXTENSIONS = {".mp4"}
-DEFAULT_VIDEO_ASPECT_RATIO = 16 / 9
+DEFAULT_VIDEO_ASPECT_RATIO = 1.0
 MIN_VIDEO_PLAYER_POOL_SIZE = 2
 MAX_VIDEO_PLAYER_POOL_SIZE = 10
 VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
 VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
-VIDEO_ASSIGN_INTERVAL_TICKS = 3
+VIDEO_ASSIGN_INTERVAL_TICKS = 8
+VIDEO_MAX_SWAPS_PER_ASSIGN = 1
 MAX_SIMULTANEOUS_PLAYING_VIDEOS = 10
 FFPROBE_BIN = shutil.which("ffprobe")
-VIDEO_PROBE_TIMEOUT_SEC = 0.9
-_VIDEO_DIMENSIONS_CACHE: dict[Path, tuple[int, int] | None] = {}
+VIDEO_PROBE_TIMEOUT_SEC = 2.5
+_VIDEO_DIMENSIONS_CACHE: dict[Path, tuple[int, int]] = {}
 _VIDEO_DIMENSIONS_LOCK = threading.Lock()
 
 
@@ -89,9 +90,8 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
         return None
 
     with _VIDEO_DIMENSIONS_LOCK:
-        cached = _VIDEO_DIMENSIONS_CACHE.get(path)
-        if cached is not None:
-            return cached
+        if path in _VIDEO_DIMENSIONS_CACHE:
+            return _VIDEO_DIMENSIONS_CACHE[path]
 
     cmd = [
         FFPROBE_BIN,
@@ -170,8 +170,9 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
                             w, h = h, w
                         dims = (w, h)
 
-    with _VIDEO_DIMENSIONS_LOCK:
-        _VIDEO_DIMENSIONS_CACHE[path] = dims
+    if dims is not None:
+        with _VIDEO_DIMENSIONS_LOCK:
+            _VIDEO_DIMENSIONS_CACHE[path] = dims
     return dims
 
 
@@ -839,6 +840,9 @@ class VideoManager:
     def active_paths(self) -> set[Path]:
         return set(self._players.keys())
 
+    def active_paths_ordered(self) -> list[Path]:
+        return list(self._players.keys())
+
     def set_playing_paths(self, paths: set[Path]):
         self._playing_paths = set(paths) & set(self._players.keys())
         self._apply_playback_states()
@@ -1463,32 +1467,52 @@ class MarqueeWidget(QOpenGLWidget):
                 self.videos.invalidate()
             return
 
-        current_active = self.videos.active_paths()
-        desired_paths: list[Path] = []
+        current_active_ordered = self.videos.active_paths_ordered()
+        current_active_set = set(current_active_ordered)
 
-        # Keep already active paths as long as they remain in unload range.
-        kept_paths = [path for path in current_active if path in candidate_map]
-        kept_paths.sort(key=lambda path: candidate_map[path][0])
-        desired_paths.extend(kept_paths[:self.videos.max_size])
+        in_window_paths = [path for path in current_active_ordered if path in candidate_map]
+        out_of_window_paths = [path for path in current_active_ordered if path not in candidate_map]
+        newcomer_paths = [
+            path
+            for path, (score, _distance, _in_active, _entry) in sorted(
+                candidate_map.items(),
+                key=lambda item: item[1][0],
+            )
+            if path not in current_active_set
+        ]
+
+        # Limit decoder source churn: only swap a small number of players per assignment cycle.
+        swap_budget = min(VIDEO_MAX_SWAPS_PER_ASSIGN, len(out_of_window_paths), len(newcomer_paths))
+        kept_out_of_window = out_of_window_paths[swap_budget:]
+        promoted_newcomers = newcomer_paths[:swap_budget]
+
+        desired_paths = in_window_paths + kept_out_of_window + promoted_newcomers
 
         if len(desired_paths) < self.videos.max_size:
-            newcomer_paths = [
-                path
-                for path, (score, _distance, _in_active, _entry) in sorted(
-                    candidate_map.items(),
-                    key=lambda item: item[1][0],
-                )
-                if path not in current_active
+            additional = [
+                path for path in newcomer_paths[swap_budget:]
+                if path not in desired_paths
             ]
-            desired_paths.extend(newcomer_paths[: self.videos.max_size - len(desired_paths)])
+            desired_paths.extend(additional[: self.videos.max_size - len(desired_paths)])
+        if len(desired_paths) > self.videos.max_size:
+            desired_paths = desired_paths[:self.videos.max_size]
 
-        desired_entries = [candidate_map[path][3] for path in desired_paths]
+        desired_entries: list[ImageEntry] = []
+        for path in desired_paths:
+            cand = candidate_map.get(path)
+            if cand is not None:
+                desired_entries.append(cand[3])
+                continue
+            index = self._entry_indices.get(path)
+            if index is None:
+                continue
+            desired_entries.append(self.entries[index])
         self.videos.set_active_entries(desired_entries)
 
         playing_ranked = [
             (candidate_map[path][1], path)
             for path in desired_paths
-            if candidate_map[path][2]
+            if path in candidate_map and candidate_map[path][2]
         ]
         if playing_ranked:
             playing_ranked.sort(key=lambda item: item[0])
