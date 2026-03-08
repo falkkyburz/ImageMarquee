@@ -69,7 +69,9 @@ GIF_EXTENSIONS = {".gif"}
 VIDEO_EXTENSIONS = {".mp4"}
 DEFAULT_VIDEO_ASPECT_RATIO = 16 / 9
 MIN_VIDEO_PLAYER_POOL_SIZE = 2
-MAX_VIDEO_PLAYER_POOL_SIZE = 6
+MAX_VIDEO_PLAYER_POOL_SIZE = 10
+VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
+VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
 
 
 class ImageEntry:
@@ -683,7 +685,7 @@ class VideoManager:
 
         while len(self._players) > capacity:
             _path, state = self._players.popitem(last=False)
-            self._release_state(state, keep_snapshot=True)
+            self._release_state(state, keep_snapshot=False)
             self._available.append(state)
 
         while len(self._players) + len(self._available) > capacity and self._available:
@@ -702,7 +704,7 @@ class VideoManager:
         stale_paths = [path for path in self._players if path not in desired_paths]
         for path in stale_paths:
             state = self._players.pop(path)
-            self._release_state(state, keep_snapshot=True)
+            self._release_state(state, keep_snapshot=False)
             self._available.append(state)
 
         for entry in entries:
@@ -735,6 +737,9 @@ class VideoManager:
     @property
     def active_count(self) -> int:
         return len(self._players)
+
+    def active_paths(self) -> set[Path]:
+        return set(self._players.keys())
 
     def set_paused(self, paused: bool):
         now_ms = self._now_ms()
@@ -818,6 +823,7 @@ class VideoManager:
             self._evict_snapshots()
 
         self._capture_timeline(state, self._now_ms())
+        self._prune_timelines()
         state.player.stop()
         state.player.setSource(QUrl())
         state.entry = None
@@ -825,9 +831,22 @@ class VideoManager:
         state.pixmap = QPixmap()
 
     def _evict_snapshots(self):
-        max_snapshots = max(self.max_size * 3, 8)
+        max_snapshots = max(self.max_size, 6)
         while len(self._snapshot_cache) > max_snapshots:
             self._snapshot_cache.popitem(last=False)
+        self._prune_timelines()
+
+    def _prune_timelines(self):
+        max_timelines = max(self.max_size * VIDEO_TIMELINE_CACHE_MULTIPLIER, 32)
+        if len(self._timelines) <= max_timelines:
+            return
+        pinned = set(self._players.keys()) | set(self._snapshot_cache.keys())
+        for path in list(self._timelines.keys()):
+            if len(self._timelines) <= max_timelines:
+                break
+            if path in pinned:
+                continue
+            self._timelines.pop(path, None)
 
     def _make_state(self) -> VideoState:
         sink = QVideoSink(self._parent)
@@ -961,6 +980,7 @@ class MarqueeWidget(QOpenGLWidget):
 
         # Precomputed cumulative x-positions for fast lookup
         self._positions: list[int] = []
+        self._entry_indices: dict[Path, int] = {}
         self._total_width: int = 0
 
         # Delta-time tracking
@@ -988,7 +1008,7 @@ class MarqueeWidget(QOpenGLWidget):
     def _target_video_pool_size(self) -> int:
         estimated_video_width = max(240, int(self.display_height * 0.9))
         visible_slots = max(1, (max(1, self.width()) + estimated_video_width - 1) // estimated_video_width)
-        desired = visible_slots + 1  # one extra slot for the next entering video
+        desired = visible_slots + VIDEO_PLAYER_LOOKAHEAD_SLOTS
         return max(MIN_VIDEO_PLAYER_POOL_SIZE, min(MAX_VIDEO_PLAYER_POOL_SIZE, desired))
 
     def _sync_video_pool_size(self):
@@ -1014,6 +1034,7 @@ class MarqueeWidget(QOpenGLWidget):
         self.gifs.set_display_height(self.display_height)
         self.videos.set_display_height(self.display_height)
         self._positions.clear()
+        self._entry_indices.clear()
         self._total_width = 0
         self.scroll_offset = 0.0
         self._has_animated_media = False
@@ -1026,8 +1047,10 @@ class MarqueeWidget(QOpenGLWidget):
     def _rebuild_positions(self):
         """Full rebuild — used after resize or shuffle."""
         self._positions.clear()
+        self._entry_indices.clear()
         x = 0
-        for entry in self.entries:
+        for index, entry in enumerate(self.entries):
+            self._entry_indices[entry.path] = index
             self._positions.append(x)
             x += entry.scaled_width + self.gap
         self._total_width = x
@@ -1036,6 +1059,7 @@ class MarqueeWidget(QOpenGLWidget):
         """Incremental append — O(len(new_entries)) instead of O(all entries)."""
         x = self._total_width
         for entry in new_entries:
+            self._entry_indices[entry.path] = len(self._positions)
             self._positions.append(x)
             x += entry.scaled_width + self.gap
         self._total_width = x
@@ -1194,6 +1218,24 @@ class MarqueeWidget(QOpenGLWidget):
         for i, _p in self._iter_wrapped_items(left, right):
             yield i
 
+    def _iter_visible_items(self, left: float, right: float):
+        """Yield visible items in screen order without scanning the full strip."""
+        if not self.entries or self._total_width == 0:
+            return
+
+        total = self._total_width
+        start_wrap = int(left // total) - 1
+        end_wrap = int(right // total) + 1
+
+        for wrap in range(start_wrap, end_wrap + 1):
+            offset = wrap * total
+            start, end = self._find_index_range(left - offset, right - offset)
+            for i in range(start, end):
+                entry = self.entries[i]
+                pos = self._positions[i] + offset
+                if pos + entry.scaled_width >= left and pos <= right:
+                    yield i, pos
+
     def _keep_range(self) -> tuple[float, float]:
         """Range around the viewport where decoded media should stay cached."""
         view_left = -self.scroll_offset
@@ -1204,14 +1246,22 @@ class MarqueeWidget(QOpenGLWidget):
         return view_left - self.prefetch_px, view_right + self.width()
 
     def _video_active_range(self) -> tuple[float, float]:
-        """Bounded live range for the reusable video player pool."""
+        """Range where videos should stay loaded and playing."""
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
-        leading_margin = max(self.width() // 2, self.display_height)
-        trailing_margin = max(self.width() // 3, self.display_height // 2)
+        estimated_video_width = max(240, int(self.display_height * 0.9))
+        active_span = max(estimated_video_width * self.videos.max_size, self.width())
+        leading_margin = int(active_span * 0.7)
+        trailing_margin = int(active_span * 0.35)
         if self.direction == -1:
             return view_left - trailing_margin, view_right + leading_margin
         return view_left - leading_margin, view_right + trailing_margin
+
+    def _video_unload_range(self) -> tuple[float, float]:
+        """Wider hysteresis range used to avoid rapid load/unload thrash."""
+        active_left, active_right = self._video_active_range()
+        margin = max(self.width(), self.display_height * 2)
+        return active_left - margin, active_right + margin
 
     def _reap_behind(self):
         """Evict cached images outside the keep zone using binary search."""
@@ -1235,10 +1285,11 @@ class MarqueeWidget(QOpenGLWidget):
         if not all_cached:
             return
 
-        # Build reverse lookup only for cached entries
-        for i, entry in enumerate(self.entries):
-            if entry.path in all_cached and i not in keep_indices:
-                to_evict.add(entry.path)
+        # Only inspect cached paths instead of scanning the whole folder every reap.
+        for path in all_cached:
+            index = self._entry_indices.get(path)
+            if index is None or index not in keep_indices:
+                to_evict.add(path)
 
         if to_evict:
             self.cache.evict_paths(to_evict)
@@ -1247,16 +1298,19 @@ class MarqueeWidget(QOpenGLWidget):
             self.prefetcher.discard_paths(to_evict)
 
     def _ensure_nearby_videos_loaded(self):
-        """Start video players only for videos near the viewport."""
+        """Keep only nearby videos loaded and release videos far from viewport."""
         if not self.entries or self._total_width == 0:
             return
 
-        keep_left, keep_right = self._video_active_range()
+        active_left, active_right = self._video_active_range()
+        unload_left, unload_right = self._video_unload_range()
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
 
-        candidates: list[tuple[float, ImageEntry]] = []
-        for i, p in self._iter_wrapped_items(keep_left, keep_right):
+        active_paths = self.videos.active_paths()
+        sticky_bonus = max(self.width() // 2, self.display_height // 2)
+        candidates: list[tuple[tuple[int, float], ImageEntry]] = []
+        for i, p in self._iter_wrapped_items(unload_left, unload_right):
             entry = self.entries[i]
             if not entry.is_video:
                 continue
@@ -1269,7 +1323,12 @@ class MarqueeWidget(QOpenGLWidget):
                 distance = item_left - view_right
             else:
                 distance = 0.0
-            candidates.append((distance, entry))
+
+            in_active = (item_right >= active_left and item_left <= active_right)
+            if entry.path in active_paths:
+                distance = max(0.0, distance - sticky_bonus)
+            score = (0 if in_active else 1, distance)
+            candidates.append((score, entry))
 
         if not candidates:
             if self.videos.tracked_paths():
@@ -1277,7 +1336,7 @@ class MarqueeWidget(QOpenGLWidget):
             return
 
         candidates.sort(key=lambda item: item[0])
-        desired_entries = [entry for _distance, entry in candidates[:self.videos.max_size]]
+        desired_entries = [entry for _score, entry in candidates[:self.videos.max_size]]
         self.videos.set_active_entries(desired_entries)
 
     def _request_prefetch(self):
@@ -1313,7 +1372,6 @@ class MarqueeWidget(QOpenGLWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), self.bg_color)
 
         if not self.entries:
@@ -1329,46 +1387,29 @@ class MarqueeWidget(QOpenGLWidget):
             painter.end()
             return
 
-        total = self._total_width
-        if total == 0:
+        if self._total_width == 0:
             painter.end()
             return
 
         widget_w = self.width()
         widget_h = self.height()
         dh = self.display_height
+        view_left = -self.scroll_offset
+        view_right = view_left + widget_w
 
-        base_offset = self.scroll_offset % total
-        if base_offset > 0:
-            base_offset -= total
+        for i, world_x in self._iter_visible_items(view_left, view_right):
+            entry = self.entries[i]
+            img_x = world_x + self.scroll_offset
 
-        strip_x = base_offset
-        max_passes = (widget_w // max(total, 1)) + 3
-
-        for _ in range(max_passes):
-            if strip_x > widget_w:
-                break
-            for i, entry in enumerate(self.entries):
-                img_x = strip_x + self._positions[i]
-                img_right = img_x + entry.scaled_width
-
-                if img_right < 0:
-                    continue
-                if img_x > widget_w:
-                    break
-
-                # GIFs and videos have their own live playback managers.
-                if entry.is_gif:
-                    pix = self.gifs.get_frame(entry)
-                elif entry.is_video:
-                    pix = self.videos.get_frame(entry)
-                else:
-                    pix = self.cache.get(entry, dh)
-                if pix is not None:
-                    y = (widget_h - pix.height()) / 2
-                    painter.drawPixmap(int(img_x), int(y), pix)
-
-            strip_x += total
+            if entry.is_gif:
+                pix = self.gifs.get_frame(entry)
+            elif entry.is_video:
+                pix = self.videos.get_frame(entry)
+            else:
+                pix = self.cache.get(entry, dh)
+            if pix is not None:
+                y = (widget_h - pix.height()) / 2
+                painter.drawPixmap(int(img_x), int(y), pix)
 
         # FPS / stats overlay
         if self.show_fps:
