@@ -781,6 +781,13 @@ class VideoManager:
     def tracked_paths(self) -> set[Path]:
         return set(self._players.keys())
 
+    def _on_video_size_changed(self, state: VideoState, size: QSize):
+        entry = state.entry
+        if entry is None:
+            return
+        if size.isValid() and entry.update_dimensions(size.width(), size.height(), self._display_height):
+            self._on_dimensions_changed()
+
     def _on_player_error(self, state: VideoState):
         if state.entry is not None:
             print(f"Video error for '{state.entry.path}': {state.player.errorString()}")
@@ -822,10 +829,15 @@ class VideoManager:
     def _make_state(self) -> VideoState:
         widget = QVideoWidget(self._parent)
         widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        widget.setAspectRatioMode(Qt.KeepAspectRatioByExpanding)
+        widget.setAspectRatioMode(Qt.KeepAspectRatio)
         widget.hide()
         player = QMediaPlayer(self._parent)
         state = VideoState(player, widget)
+        sink = widget.videoSink()
+        if sink is not None:
+            sink.videoSizeChanged.connect(
+                lambda size, s=state: self._on_video_size_changed(s, size)
+            )
         player.errorOccurred.connect(
             lambda *_args, s=state: self._on_player_error(s)
         )
@@ -1130,10 +1142,11 @@ class MarqueeWidget(QOpenGLWidget):
 
         if self.entries and (
             scanned
-            or moved
             or self._tick_count % VIDEO_ASSIGN_INTERVAL_TICKS == 0
         ):
             self._ensure_nearby_videos_loaded()
+
+        if self.entries and self.videos.active_count:
             self.videos.set_widget_rects(self._visible_video_rects())
         elif self.videos.active_count:
             self.videos.set_widget_rects({})
@@ -1254,8 +1267,8 @@ class MarqueeWidget(QOpenGLWidget):
         view_left = -self.scroll_offset
         view_right = view_left + self.width()
         widget_h = self.height()
-        dh = min(self.display_height, widget_h)
-        y = (widget_h - dh) // 2
+        dh = widget_h
+        y = 0
         center_x = self.width() * 0.5
 
         rects: dict[Path, QRect] = {}
