@@ -12,7 +12,7 @@ Options:
     -H, --height INT    Image display height in pixels (default: 0 = auto/fullscreen)
     -c, --cache INT     Max images to keep in memory (default: 64)
     -P, --prefetch INT  Prefetch lookahead in pixels (default: 2000)
-    -f, --fps INT       Target frame rate cap (default: 144)
+    -f, --fps INT       Target frame rate cap (default: 60)
     -s, --shuffle       Shuffle image order
     -r, --recursive     Scan subfolders recursively
     -F, --fullscreen    Start in fullscreen mode
@@ -46,6 +46,7 @@ import subprocess
 import time
 import os
 import shutil
+import json
 from collections import OrderedDict
 from pathlib import Path
 
@@ -74,7 +75,7 @@ MIN_VIDEO_PLAYER_POOL_SIZE = 2
 MAX_VIDEO_PLAYER_POOL_SIZE = 10
 VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
 VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
-VIDEO_ASSIGN_INTERVAL_TICKS = 12
+VIDEO_ASSIGN_INTERVAL_TICKS = 3
 MAX_SIMULTANEOUS_PLAYING_VIDEOS = 10
 FFPROBE_BIN = shutil.which("ffprobe")
 VIDEO_PROBE_TIMEOUT_SEC = 0.9
@@ -96,8 +97,8 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
         FFPROBE_BIN,
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=p=0:s=x",
+        "-show_entries", "stream=width,height,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation",
+        "-of", "json",
         str(path),
     ]
     try:
@@ -113,18 +114,61 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
 
     dims: tuple[int, int] | None = None
     if result is not None and result.returncode == 0 and result.stdout:
-        raw = result.stdout.decode("utf-8", errors="ignore").strip()
-        if raw:
-            first = raw.splitlines()[0].strip()
-            parts = first.split("x", 1)
-            if len(parts) == 2:
-                try:
-                    w = int(parts[0])
-                    h = int(parts[1])
+        try:
+            payload = json.loads(result.stdout.decode("utf-8", errors="ignore"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+
+        if isinstance(payload, dict):
+            streams = payload.get("streams")
+            if isinstance(streams, list) and streams:
+                stream = streams[0] if isinstance(streams[0], dict) else None
+                if isinstance(stream, dict):
+                    try:
+                        w = int(stream.get("width") or 0)
+                        h = int(stream.get("height") or 0)
+                    except (TypeError, ValueError):
+                        w = 0
+                        h = 0
+
                     if w > 0 and h > 0:
+                        # Account for non-square pixels when provided by metadata.
+                        sar = stream.get("sample_aspect_ratio")
+                        if isinstance(sar, str) and ":" in sar and sar != "0:1":
+                            try:
+                                sar_num, sar_den = sar.split(":", 1)
+                                sar_num_i = int(sar_num)
+                                sar_den_i = int(sar_den)
+                                if sar_num_i > 0 and sar_den_i > 0:
+                                    w = max(1, int(round(w * (sar_num_i / sar_den_i))))
+                            except ValueError:
+                                pass
+
+                        rotation = 0
+                        tags = stream.get("tags")
+                        if isinstance(tags, dict) and "rotate" in tags:
+                            try:
+                                rotation = int(float(tags.get("rotate", 0)))
+                            except (TypeError, ValueError):
+                                rotation = 0
+
+                        side_data = stream.get("side_data_list")
+                        if isinstance(side_data, list):
+                            for item in side_data:
+                                if not isinstance(item, dict):
+                                    continue
+                                if "rotation" not in item:
+                                    continue
+                                try:
+                                    rotation = int(float(item.get("rotation", 0)))
+                                except (TypeError, ValueError):
+                                    pass
+                                break
+
+                        rot_norm = abs(rotation) % 180
+                        if rot_norm == 90:
+                            w, h = h, w
                         dims = (w, h)
-                except ValueError:
-                    dims = None
 
     with _VIDEO_DIMENSIONS_LOCK:
         _VIDEO_DIMENSIONS_CACHE[path] = dims
@@ -1848,8 +1892,8 @@ def parse_args():
         help="Prefetch lookahead in pixels (1000-100000, default: 2000)"
     )
     parser.add_argument(
-        "-f", "--fps", type=int, default=144,
-        help="Target frame rate cap (1-240, default: 144)"
+        "-f", "--fps", type=int, default=60,
+        help="Target frame rate cap (1-240, default: 60)"
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true",
