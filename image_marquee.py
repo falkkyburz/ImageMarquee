@@ -52,12 +52,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QLabel,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt, QSize, QTimer, QElapsedTimer, Signal, QUrl
+from PySide6.QtCore import Qt, QSize, QRect, QTimer, QElapsedTimer, Signal, QUrl
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QKeyEvent, QFont,
     QPen, QImageReader, QSurfaceFormat, QMovie, QIcon
 )
-from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
+from PySide6.QtMultimedia import QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".mp4"}
 
@@ -73,7 +74,7 @@ MAX_VIDEO_PLAYER_POOL_SIZE = 10
 VIDEO_PLAYER_LOOKAHEAD_SLOTS = 8
 VIDEO_TIMELINE_CACHE_MULTIPLIER = 4
 VIDEO_ASSIGN_INTERVAL_TICKS = 6
-MAX_SIMULTANEOUS_PLAYING_VIDEOS = 3
+MAX_SIMULTANEOUS_PLAYING_VIDEOS = 10
 
 
 class ImageEntry:
@@ -637,12 +638,11 @@ class GifManager:
 class VideoState:
     """Reusable playback slot for one active video."""
 
-    __slots__ = ("player", "sink", "pixmap", "entry", "pending_seek_ms")
+    __slots__ = ("player", "widget", "entry", "pending_seek_ms")
 
-    def __init__(self, player: QMediaPlayer, sink: QVideoSink):
+    def __init__(self, player: QMediaPlayer, widget: QVideoWidget):
         self.player = player
-        self.sink = sink
-        self.pixmap = QPixmap()
+        self.widget = widget
         self.entry: ImageEntry | None = None
         self.pending_seek_ms: int | None = None
 
@@ -659,7 +659,7 @@ class VideoTimeline:
 
 
 class VideoManager:
-    """Manages a fixed pool of looping inline video players."""
+    """Manages a fixed pool of inline video players and viewport placement."""
 
     def __init__(self, on_dimensions_changed, max_size: int = 16, parent=None):
         self.max_size = max(1, max_size)
@@ -669,7 +669,6 @@ class VideoManager:
         self._paused: bool = False
         self._parent = parent
         self._on_dimensions_changed = on_dimensions_changed
-        self._snapshot_cache: OrderedDict[Path, QPixmap] = OrderedDict()
         self._timelines: dict[Path, VideoTimeline] = {}
         self._playing_paths: set[Path] = set()
 
@@ -699,7 +698,7 @@ class VideoManager:
             self._available.append(self._make_state())
 
         self.max_size = capacity
-        self._evict_snapshots()
+        self._evict_timelines()
 
     def set_active_entries(self, entries: list[ImageEntry]):
         """Retarget the fixed player pool to the requested nearby videos."""
@@ -721,17 +720,10 @@ class VideoManager:
             state = self._available.pop()
             self._assign_state(state, entry)
             self._players[entry.path] = state
+        self._playing_paths.intersection_update(self._players.keys())
+        self._evict_timelines()
 
     def get_frame(self, entry: ImageEntry) -> QPixmap | None:
-        """Get the latest live frame or a recent still snapshot."""
-        state = self._players.get(entry.path)
-        if state is not None and not state.pixmap.isNull():
-            return state.pixmap
-
-        pix = self._snapshot_cache.get(entry.path)
-        if pix is not None:
-            self._snapshot_cache.move_to_end(entry.path)
-            return pix
         return None
 
     def has_key(self, path: Path) -> bool:
@@ -744,6 +736,22 @@ class VideoManager:
     def active_paths(self) -> set[Path]:
         return set(self._players.keys())
 
+    def set_playing_paths(self, paths: set[Path]):
+        self._playing_paths = set(paths) & set(self._players.keys())
+        self._apply_playback_states()
+
+    def set_widget_rects(self, rects: dict[Path, QRect]):
+        """Position video widgets for currently visible videos; hide the rest."""
+        for path, state in self._players.items():
+            rect = rects.get(path)
+            if rect is None:
+                state.widget.hide()
+                continue
+            if state.widget.geometry() != rect:
+                state.widget.setGeometry(rect)
+            state.widget.show()
+            state.widget.raise_()
+
     def set_paused(self, paused: bool):
         now_ms = self._now_ms()
         if paused and not self._paused:
@@ -754,22 +762,16 @@ class VideoManager:
         if not paused:
             self._resync_timelines(now_ms)
 
-    def set_playing_paths(self, paths: set[Path]):
-        self._playing_paths = set(paths)
-        self._apply_playback_states()
-
     def evict_paths(self, paths: set[Path]):
         """Actively stop and remove specific video players."""
-        for p in paths:
-            self._snapshot_cache.pop(p, None)
         for p in paths:
             state = self._players.pop(p, None)
             if state is not None:
                 self._release_state(state, keep_snapshot=False)
                 self._available.append(state)
+        self._playing_paths.difference_update(paths)
 
     def invalidate(self):
-        self._snapshot_cache.clear()
         self._playing_paths.clear()
         for state in self._players.values():
             self._release_state(state, keep_snapshot=False)
@@ -777,32 +779,7 @@ class VideoManager:
         self._players.clear()
 
     def tracked_paths(self) -> set[Path]:
-        return set(self._players.keys()) | set(self._snapshot_cache.keys())
-
-    def _on_frame_changed(self, state: VideoState, frame: QVideoFrame):
-        entry = state.entry
-        if entry is None or self._players.get(entry.path) is not state or not frame.isValid():
-            return
-
-        image = frame.toImage()
-        if image.isNull():
-            return
-
-        if entry.update_dimensions(image.width(), image.height(), self._display_height):
-            self._on_dimensions_changed()
-
-        scaled = image.scaledToHeight(self._display_height, Qt.FastTransformation)
-        state.pixmap = QPixmap.fromImage(scaled)
-        self._snapshot_cache[entry.path] = state.pixmap
-        self._snapshot_cache.move_to_end(entry.path)
-        self._evict_snapshots()
-
-    def _on_video_size_changed(self, state: VideoState, size: QSize):
-        entry = state.entry
-        if entry is None:
-            return
-        if size.isValid() and entry.update_dimensions(size.width(), size.height(), self._display_height):
-            self._on_dimensions_changed()
+        return set(self._players.keys())
 
     def _on_player_error(self, state: VideoState):
         if state.entry is not None:
@@ -810,9 +787,8 @@ class VideoManager:
 
     def _assign_state(self, state: VideoState, entry: ImageEntry):
         state.entry = entry
-        state.pixmap = QPixmap()
+        state.widget.hide()
         state.pending_seek_ms = self._estimate_position(entry.path)
-        self._snapshot_cache.pop(entry.path, None)
         state.player.stop()
         state.player.setSource(QUrl())
         state.player.setPlaybackRate(1.0)
@@ -821,32 +797,21 @@ class VideoManager:
 
     def _release_state(self, state: VideoState, keep_snapshot: bool = True):
         """Stop playback and clear the assigned source without destroying the slot."""
-        if keep_snapshot and state.entry is not None and not state.pixmap.isNull():
-            self._snapshot_cache[state.entry.path] = state.pixmap
-            self._snapshot_cache.move_to_end(state.entry.path)
-            self._evict_snapshots()
-
+        state.widget.hide()
         if state.entry is not None:
             self._playing_paths.discard(state.entry.path)
         self._capture_timeline(state, self._now_ms())
-        self._prune_timelines()
+        self._evict_timelines()
         state.player.stop()
         state.player.setSource(QUrl())
         state.entry = None
         state.pending_seek_ms = None
-        state.pixmap = QPixmap()
 
-    def _evict_snapshots(self):
-        max_snapshots = max(self.max_size, 6)
-        while len(self._snapshot_cache) > max_snapshots:
-            self._snapshot_cache.popitem(last=False)
-        self._prune_timelines()
-
-    def _prune_timelines(self):
+    def _evict_timelines(self):
         max_timelines = max(self.max_size * VIDEO_TIMELINE_CACHE_MULTIPLIER, 32)
         if len(self._timelines) <= max_timelines:
             return
-        pinned = set(self._players.keys()) | set(self._snapshot_cache.keys())
+        pinned = set(self._players.keys())
         for path in list(self._timelines.keys()):
             if len(self._timelines) <= max_timelines:
                 break
@@ -855,15 +820,12 @@ class VideoManager:
             self._timelines.pop(path, None)
 
     def _make_state(self) -> VideoState:
-        sink = QVideoSink(self._parent)
+        widget = QVideoWidget(self._parent)
+        widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        widget.setAspectRatioMode(Qt.KeepAspectRatioByExpanding)
+        widget.hide()
         player = QMediaPlayer(self._parent)
-        state = VideoState(player, sink)
-        sink.videoFrameChanged.connect(
-            lambda frame, s=state: self._on_frame_changed(s, frame)
-        )
-        sink.videoSizeChanged.connect(
-            lambda size, s=state: self._on_video_size_changed(s, size)
-        )
+        state = VideoState(player, widget)
         player.errorOccurred.connect(
             lambda *_args, s=state: self._on_player_error(s)
         )
@@ -876,15 +838,16 @@ class VideoManager:
         player.mediaStatusChanged.connect(
             lambda status, s=state: self._on_media_status_changed(s, status)
         )
-        player.setVideoOutput(sink)
+        player.setVideoOutput(widget)
         player.setLoops(QMediaPlayer.Loops.Infinite)
         return state
 
     def _destroy_state(self, state: VideoState):
+        state.widget.hide()
         state.player.stop()
         state.player.setSource(QUrl())
         state.player.deleteLater()
-        state.sink.deleteLater()
+        state.widget.deleteLater()
 
     def _on_position_changed(self, state: VideoState, position: int):
         if state.entry is None:
@@ -911,10 +874,7 @@ class VideoManager:
         if state.pending_seek_ms is not None:
             state.player.setPosition(state.pending_seek_ms)
             state.pending_seek_ms = None
-        if self._should_play(state.entry.path):
-            state.player.play()
-        else:
-            state.player.pause()
+        self._apply_playback_states()
 
     def _timeline_for(self, path: Path) -> VideoTimeline:
         timeline = self._timelines.get(path)
@@ -1174,6 +1134,9 @@ class MarqueeWidget(QOpenGLWidget):
             or self._tick_count % VIDEO_ASSIGN_INTERVAL_TICKS == 0
         ):
             self._ensure_nearby_videos_loaded()
+            self.videos.set_widget_rects(self._visible_video_rects())
+        elif self.videos.active_count:
+            self.videos.set_widget_rects({})
 
         # Smooth-upgrade one image per tick (skip at high speed)
         upgraded = False
@@ -1282,6 +1245,36 @@ class MarqueeWidget(QOpenGLWidget):
         active_left, active_right = self._video_active_range()
         margin = max(self.width(), self.display_height * 2)
         return active_left - margin, active_right + margin
+
+    def _visible_video_rects(self) -> dict[Path, QRect]:
+        """Screen-space rectangles for currently visible video entries."""
+        if not self.entries or self._total_width == 0:
+            return {}
+
+        view_left = -self.scroll_offset
+        view_right = view_left + self.width()
+        widget_h = self.height()
+        dh = min(self.display_height, widget_h)
+        y = (widget_h - dh) // 2
+        center_x = self.width() * 0.5
+
+        rects: dict[Path, QRect] = {}
+        for i, world_x in self._iter_visible_items(view_left, view_right):
+            entry = self.entries[i]
+            if not entry.is_video:
+                continue
+            x = int(world_x + self.scroll_offset)
+            rect = QRect(x, y, max(1, entry.scaled_width), dh)
+            prev = rects.get(entry.path)
+            if prev is None:
+                rects[entry.path] = rect
+                continue
+            prev_dist = abs(prev.center().x() - center_x)
+            new_dist = abs(rect.center().x() - center_x)
+            if new_dist < prev_dist:
+                rects[entry.path] = rect
+
+        return rects
 
     def _reap_behind(self):
         """Evict cached images outside the keep zone using binary search."""
@@ -1437,7 +1430,7 @@ class MarqueeWidget(QOpenGLWidget):
             if entry.is_gif:
                 pix = self.gifs.get_frame(entry)
             elif entry.is_video:
-                pix = self.videos.get_frame(entry)
+                continue
             else:
                 pix = self.cache.get(entry, dh)
             if pix is not None:
