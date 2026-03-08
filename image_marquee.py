@@ -132,6 +132,8 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
                         h = 0
 
                     if w > 0 and h > 0:
+                        rotation_known = False
+
                         # Account for non-square pixels when provided by metadata.
                         sar = stream.get("sample_aspect_ratio")
                         if isinstance(sar, str) and ":" in sar and sar != "0:1":
@@ -149,6 +151,7 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
                         if isinstance(tags, dict) and "rotate" in tags:
                             try:
                                 rotation = int(float(tags.get("rotate", 0)))
+                                rotation_known = True
                             except (TypeError, ValueError):
                                 rotation = 0
 
@@ -161,6 +164,7 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
                                     continue
                                 try:
                                     rotation = int(float(item.get("rotation", 0)))
+                                    rotation_known = True
                                 except (TypeError, ValueError):
                                     pass
                                 break
@@ -168,6 +172,25 @@ def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
                         rot_norm = abs(rotation) % 180
                         if rot_norm == 90:
                             w, h = h, w
+
+                        # Some rotated videos expose corrected display aspect ratio
+                        # without a reliable rotate tag/side-data. Use DAR as fallback.
+                        dar = stream.get("display_aspect_ratio")
+                        if isinstance(dar, str) and ":" in dar and dar != "0:1":
+                            try:
+                                dar_num, dar_den = dar.split(":", 1)
+                                dar_num_i = int(dar_num)
+                                dar_den_i = int(dar_den)
+                            except ValueError:
+                                dar_num_i = 0
+                                dar_den_i = 0
+
+                            if dar_num_i > 0 and dar_den_i > 0 and h > 0:
+                                dar_ratio = dar_num_i / dar_den_i
+                                current_ratio = w / h if h > 0 else dar_ratio
+                                mismatch = abs(current_ratio - dar_ratio)
+                                if mismatch > (0.08 if rotation_known else 0.15):
+                                    w = max(1, int(round(h * dar_ratio)))
                         dims = (w, h)
 
     if dims is not None:
